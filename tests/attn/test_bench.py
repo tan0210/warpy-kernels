@@ -76,7 +76,7 @@ def bench_layout(ctx, n, B=2, H=16, d=128):
     launch_view, *_ = make_attn_fwd(qv, kv, vv, sq, sk, sv)
     ms_view = time_launch_ms(launch_view, 50)
     bufs = [torch.empty(x.shape, dtype=x.dtype, device="cuda") for x in (q8, k8, v8)]
-    launch_copy, out, *_ = make_attn_fwd(*bufs, sq, sk, sv)
+    launch_copy, out, *_ = make_attn_fwd(*bufs, sq, sk, sv) # type: ignore
 
     def with_copies():
         for buf, x in zip(bufs, (qv, kv, vv)):

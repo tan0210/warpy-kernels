@@ -58,20 +58,44 @@ class BwdPrep:
         return b, hq, rem % nq, hq // (h_q // h_kv)
 
     @cute.jit
-    def __call__(self, mdO: cute.Tensor, mO: cute.Tensor, mPmax: cute.Tensor, mdO8: cute.Tensor,
-                 mD: cute.Tensor, mTB: cute.Tensor, mStats: cute.Tensor, mDqAcc: cute.Tensor, rows: Int32,
-                 nq: Int32, nq_pad: Int32, h_q: Int32, h_kv: Int32):
+    def __call__(
+        self,
+        mdO: cute.Tensor,
+        mO: cute.Tensor,
+        mPmax: cute.Tensor,
+        mdO8: cute.Tensor,
+        mD: cute.Tensor,
+        mTB: cute.Tensor,
+        mStats: cute.Tensor,
+        mDqAcc: cute.Tensor,
+        rows: Int32,
+        nq: Int32,
+        nq_pad: Int32,
+        h_q: Int32,
+        h_kv: Int32,
+    ):
         nblk = (rows + (self.ROWS_PER_CTA - 1)) // self.ROWS_PER_CTA
         rows_pad = (rows // nq) * nq_pad
         nblk_pad = (rows_pad + (self.ROWS_PER_CTA - 1)) // self.ROWS_PER_CTA
         self.k_amax(mdO, mStats, mDqAcc, rows_pad, nq, nq_pad, h_q, h_kv).launch(
-            grid=[nblk_pad, 1, 1], block=[256, 1, 1])
-        self.k_quant(mdO, mO, mPmax, mdO8, mD, mTB, mStats, mDqAcc, rows, nq, nq_pad, h_q, h_kv).launch(
-            grid=[nblk, 1, 1], block=[256, 1, 1])
+            grid=[nblk_pad, 1, 1], block=[256, 1, 1]
+        )
+        self.k_quant(
+            mdO, mO, mPmax, mdO8, mD, mTB, mStats, mDqAcc, rows, nq, nq_pad, h_q, h_kv
+        ).launch(grid=[nblk, 1, 1], block=[256, 1, 1])
 
     @cute.kernel
-    def k_amax(self, mdO: cute.Tensor, mStats: cute.Tensor, mDqAcc: cute.Tensor, rows_pad: Int32, nq: Int32,
-               nq_pad: Int32, h_q: Int32, h_kv: Int32):
+    def k_amax(
+        self,
+        mdO: cute.Tensor,
+        mStats: cute.Tensor,
+        mDqAcc: cute.Tensor,
+        rows_pad: Int32,
+        nq: Int32,
+        nq_pad: Int32,
+        h_q: Int32,
+        h_kv: Int32,
+    ):
         # real rows feed the `dO` amax, padded rows zero their `dQaccum` row
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -81,22 +105,43 @@ class BwdPrep:
         row = (b * h_q + hq) * nq + i
         if const_expr(self.zero_dq):  # noqa: SIM102  # the DSL needs the const_expr and runtime ifs kept separate
             if prow < rows_pad and i >= nq:
-                gz = Int64(mDqAcc.iterator.toint()) + (Int64(prow) * self.d + Int64(lane * self.per_lane)) * 4
+                gz = (
+                    Int64(mDqAcc.iterator.toint())
+                    + (Int64(prow) * self.d + Int64(lane * self.per_lane)) * 4
+                )
                 st_global_zero(gz, self.per_lane)
         if prow < rows_pad and i < nq:
             m = Float32(0.0)
-            xin = ld_global_bf16(Int64(mdO.iterator.toint()) + (Int64(row) * self.d + Int64(lane * self.per_lane)) * 2,
-                                 self.per_lane)
+            xin = ld_global_bf16(
+                Int64(mdO.iterator.toint())
+                + (Int64(row) * self.d + Int64(lane * self.per_lane)) * 2,
+                self.per_lane,
+            )
             for e in cutlass.range_constexpr(self.per_lane):
                 m = cute.arch.fmax(m, xin[e] if xin[e] > Float32(0.0) else -xin[e])
             m = cute.arch.warp_reduction_max(m, threads_in_group=32)
             if lane == 0:
-                red_max_pos_f32(Int64(mStats.iterator.toint()) + Int64((b * h_kv + hkv) * 4) * 4, m)
+                red_max_pos_f32(
+                    Int64(mStats.iterator.toint()) + Int64((b * h_kv + hkv) * 4) * 4, m
+                )
 
     @cute.kernel
-    def k_quant(self, mdO: cute.Tensor, mO: cute.Tensor, mPmax: cute.Tensor, mdO8: cute.Tensor,
-                mD: cute.Tensor, mTB: cute.Tensor, mStats: cute.Tensor, mDqAcc: cute.Tensor, rows: Int32, nq: Int32,
-                nq_pad: Int32, h_q: Int32, h_kv: Int32):
+    def k_quant(
+        self,
+        mdO: cute.Tensor,
+        mO: cute.Tensor,
+        mPmax: cute.Tensor,
+        mdO8: cute.Tensor,
+        mD: cute.Tensor,
+        mTB: cute.Tensor,
+        mStats: cute.Tensor,
+        mDqAcc: cute.Tensor,
+        rows: Int32,
+        nq: Int32,
+        nq_pad: Int32,
+        h_q: Int32,
+        h_kv: Int32,
+    ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         lane = tidx % 32
@@ -107,8 +152,14 @@ class BwdPrep:
             s_do = amax * Float32(1.0 / 256.0) if amax > Float32(0.0) else Float32(1.0)
             inv = Float32(1.0) / s_do
             col0 = lane * self.per_lane
-            xin = ld_global_bf16(Int64(mdO.iterator.toint()) + (Int64(row) * self.d + Int64(col0)) * 2, self.per_lane)
-            oin = ld_global_bf16(Int64(mO.iterator.toint()) + (Int64(row) * self.d + Int64(col0)) * 2, self.per_lane)
+            xin = ld_global_bf16(
+                Int64(mdO.iterator.toint()) + (Int64(row) * self.d + Int64(col0)) * 2,
+                self.per_lane,
+            )
+            oin = ld_global_bf16(
+                Int64(mO.iterator.toint()) + (Int64(row) * self.d + Int64(col0)) * 2,
+                self.per_lane,
+            )
             x = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
             for e in cutlass.range_constexpr(self.per_lane):
                 x[e] = xin[e] * inv
@@ -120,7 +171,10 @@ class BwdPrep:
             else:
                 st_global_b16(gdst, bits)
             if const_expr(self.zero_dq):
-                gz = Int64(mDqAcc.iterator.toint()) + (Int64(prow) * self.d + Int64(col0)) * 4
+                gz = (
+                    Int64(mDqAcc.iterator.toint())
+                    + (Int64(prow) * self.d + Int64(col0)) * 4
+                )
                 st_global_zero(gz, self.per_lane)
             deq = e4m3x4_to_f32(bits)
             dsum = Float32(0.0)
@@ -134,23 +188,39 @@ class BwdPrep:
             if lane == 0:
                 mD[prow] = dsum
                 # bound `|dS| <= 2 pmax |dO| max|V|`, max-reduced per query tile
-                rb = Float32(2.0) * mPmax[row] * cute.math.sqrt(nsum, fastmath=True) * mStats[b, hkv, 2]
+                rb = (
+                    Float32(2.0)
+                    * mPmax[row]
+                    * cute.math.sqrt(nsum, fastmath=True)
+                    * mStats[b, hkv, 2]
+                )
                 tile = (b * h_q + hq) * (nq_pad // self.block_m) + i // self.block_m
                 red_max_pos_f32(Int64(mTB.iterator.toint()) + Int64(tile) * 4, rb)
 
 
 class AttnBwdSm120:
-    BC = 128          # key padding granularity, 16 keys per warp
+    BC = 128  # key padding granularity, 16 keys per warp
     # `setmaxnreg` targets: 8 x 224 + 4 x 56 equals 12 x 168, the launch allocation of 384 threads
     MMA_REGS = 224
     DQ_REGS = 56
 
-    def __init__(self, head_dim: int, causal: bool, block_m: int, num_stages: int = 2, skip_dq: bool = False,
-                 dq_bulk: bool = True, num_warps: int = 8, min_blocks: int = 0, kb_major: bool = False,
-                 dq_wg: bool = False):
+    def __init__(
+        self,
+        head_dim: int,
+        causal: bool,
+        block_m: int,
+        num_stages: int = 2,
+        skip_dq: bool = False,
+        dq_bulk: bool = True,
+        num_warps: int = 8,
+        min_blocks: int = 0,
+        kb_major: bool = False,
+        dq_wg: bool = False,
+    ):
         assert head_dim in (64, 128) and block_m in (32, 64) and num_warps in (4, 8)
         assert not dq_wg or (num_warps == 8 and not skip_dq and min_blocks in (0, 1)), (
-            "dq_wg needs 8 MMA warps, a dQ pass and one CTA per SM")
+            "dq_wg needs 8 MMA warps, a dQ pass and one CTA per SM"
+        )
         self.dq_wg = dq_wg
         self.kb_major = kb_major
         self.skip_dq = skip_dq
@@ -158,11 +228,15 @@ class AttnBwdSm120:
         self.num_warps = num_warps
         self.BC = 16 * num_warps
         self.NUM_THREADS = 32 * num_warps
-        self.threads = self.NUM_THREADS + (128 if dq_wg else 0)  # the dQ warps are one extra warpgroup
+        self.threads = self.NUM_THREADS + (
+            128 if dq_wg else 0
+        )  # the dQ warps are one extra warpgroup
         self.dq_warps = 4 if dq_wg else num_warps
         self.min_blocks = min_blocks if min_blocks > 0 else 8 // num_warps
         blocks = (block_m // 16) * (head_dim // 16)
-        assert blocks % self.dq_warps == 0, "dQ split needs a whole number of (m16 x 16-col) blocks per warp"
+        assert blocks % self.dq_warps == 0, (
+            "dQ split needs a whole number of (m16 x 16-col) blocks per warp"
+        )
         self.nb = blocks // self.dq_warps
         self.d = head_dim
         self.causal = causal
@@ -178,24 +252,33 @@ class AttnBwdSm120:
         self.do_off = self.q_off + num_stages * self.q_tile_bytes
         self.ds_off = self.do_off + num_stages * self.q_tile_bytes
         self.dq_stage_bytes = block_m * head_dim * 4
-        self.ld_stage_bytes = 2 * block_m * 4   # `L` then `D` (fp32) for one query tile
+        self.ld_stage_bytes = 2 * block_m * 4  # `L` then `D` (fp32) for one query tile
         self.ld_off = self.ds_off + 2 * self.ds_bytes
         self.dq_off = self.ld_off + num_stages * self.ld_stage_bytes
         self.smem_bytes = self.dq_off + (2 * self.dq_stage_bytes if dq_bulk else 0)
-        assert (self.smem_bytes + (1024 if dq_wg else 0)) * self.min_blocks <= SMEM_LIMIT, (
-            f"shared memory does not fit: {self.smem_bytes} B x {self.min_blocks} CTA(s)")
+        assert (
+            self.smem_bytes + (1024 if dq_wg else 0)
+        ) * self.min_blocks <= SMEM_LIMIT, (
+            f"shared memory does not fit: {self.smem_bytes} B x {self.min_blocks} CTA(s)"
+        )
         nbytes = self.smem_bytes
 
         if dq_wg:
+
             @cute.struct
             class SharedStorage:
                 # dS full and free barriers, two buffers each
                 mbar: cute.struct.MemRange[cutlass.Int64, 4]
-                buf: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, nbytes], 1024]
+                buf: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Uint8, nbytes], 1024
+                ]
         else:
+
             @cute.struct
             class SharedStorage:
-                buf: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, nbytes], 1024]
+                buf: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Uint8, nbytes], 1024
+                ]
 
         self.shared_storage = SharedStorage
 
@@ -212,45 +295,120 @@ class AttnBwdSm120:
         for i in range(max(1, total // self.NUM_THREADS)):
             idx = tidx + i * self.NUM_THREADS
             if total < self.NUM_THREADS:
-                idx = idx & (total - 1)  # extra threads repeat an identical 16-byte copy (`total` is a power of two)
+                idx = (
+                    idx & (total - 1)
+                )  # extra threads repeat an identical 16-byte copy (`total` is a power of two)
             row = idx // chunks
             ch = idx % chunks
-            cp_async16(s_addr + self._swz_off(row, ch), g_addr + Int64(row * self.d + ch * 16))
+            cp_async16(
+                s_addr + self._swz_off(row, ch), g_addr + Int64(row * self.d + ch * 16)
+            )
 
     @cute.jit
-    def _q_row0(self, it: Int32, n_q: Int32, q_start: Int32, b: Int32, hkv: Int32, h_q: Int32, h_kv: Int32,
-                nq_pad: Int32):
+    def _q_row0(
+        self,
+        it: Int32,
+        n_q: Int32,
+        q_start: Int32,
+        b: Int32,
+        hkv: Int32,
+        h_q: Int32,
+        h_kv: Int32,
+        nq_pad: Int32,
+    ):
         rep = h_q // h_kv
         hq = hkv * rep + it // n_q
         qi = q_start + it % n_q
         return (b * h_q + hq) * nq_pad + qi * self.BM, qi
 
     @cute.jit
-    def _load_q(self, it: Int32, total_it: Int32, n_q: Int32, q_start: Int32, b: Int32, hkv: Int32,
-                h_q: Int32, h_kv: Int32, nq_pad: Int32, sbase: Int32, gq: Int64, gdo: Int64, gl: Int64, gd: Int64,
-                tidx: Int32):
+    def _load_q(
+        self,
+        it: Int32,
+        total_it: Int32,
+        n_q: Int32,
+        q_start: Int32,
+        b: Int32,
+        hkv: Int32,
+        h_q: Int32,
+        h_kv: Int32,
+        nq_pad: Int32,
+        sbase: Int32,
+        gq: Int64,
+        gdo: Int64,
+        gl: Int64,
+        gd: Int64,
+        tidx: Int32,
+    ):
         if it < total_it:
             row0, _ = self._q_row0(it, n_q, q_start, b, hkv, h_q, h_kv, nq_pad)
             st = it % self.stages
-            self._load_rows(sbase + self.q_off + st * self.q_tile_bytes, gq + Int64(row0) * self.d, self.BM, tidx)
-            self._load_rows(sbase + self.do_off + st * self.q_tile_bytes, gdo + Int64(row0) * self.d, self.BM, tidx)
+            self._load_rows(
+                sbase + self.q_off + st * self.q_tile_bytes,
+                gq + Int64(row0) * self.d,
+                self.BM,
+                tidx,
+            )
+            self._load_rows(
+                sbase + self.do_off + st * self.q_tile_bytes,
+                gdo + Int64(row0) * self.d,
+                self.BM,
+                tidx,
+            )
             # `L` and `D` rows: `BM` floats each, in 16-byte pieces
             pieces = self.BM // 4
             if tidx < 2 * pieces:
                 which = tidx // pieces
-                gsrc = (gl if which == 0 else gd) + (Int64(row0) + Int64(4 * (tidx % pieces))) * 4
-                cp_async16(sbase + self.ld_off + st * self.ld_stage_bytes + which * (self.BM * 4)
-                           + (tidx % pieces) * 16, gsrc)
+                gsrc = (gl if which == 0 else gd) + (
+                    Int64(row0) + Int64(4 * (tidx % pieces))
+                ) * 4
+                cp_async16(
+                    sbase
+                    + self.ld_off
+                    + st * self.ld_stage_bytes
+                    + which * (self.BM * 4)
+                    + (tidx % pieces) * 16,
+                    gsrc,
+                )
 
     @cute.jit
     def _iter(
-        self, it: Int32, total_it: Int32, n_q: Int32, q_start: Int32, b: Int32, hkv: Int32,
-        h_q: Int32, h_kv: Int32, nq_pad: Int32, seqlen_q: Int32, seqlen_k: Int32, kblock: Int32,
-        sbase: Int32, gq: Int64, gdo: Int64, gdq: Int64, gl: Int64, gd: Int64, tidx: Int32, warp: Int32, lane: Int32,
-        beta: Float32, kc: Float32, v_row: Int32,
-        mL: cute.Tensor, mD: cute.Tensor, mTB: cute.Tensor,
-        s_acc: cute.Tensor, dp_acc: cute.Tensor, pa_t: cute.Tensor, da_t: cute.Tensor,
-        dk_acc: cute.Tensor, dv_acc: cute.Tensor, dq_acc: cute.Tensor, gcur: cute.Tensor,
+        self,
+        it: Int32,
+        total_it: Int32,
+        n_q: Int32,
+        q_start: Int32,
+        b: Int32,
+        hkv: Int32,
+        h_q: Int32,
+        h_kv: Int32,
+        nq_pad: Int32,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        kblock: Int32,
+        sbase: Int32,
+        gq: Int64,
+        gdo: Int64,
+        gdq: Int64,
+        gl: Int64,
+        gd: Int64,
+        tidx: Int32,
+        warp: Int32,
+        lane: Int32,
+        beta: Float32,
+        kc: Float32,
+        v_row: Int32,
+        mL: cute.Tensor,
+        mD: cute.Tensor,
+        mTB: cute.Tensor,
+        s_acc: cute.Tensor,
+        dp_acc: cute.Tensor,
+        pa_t: cute.Tensor,
+        da_t: cute.Tensor,
+        dk_acc: cute.Tensor,
+        dv_acc: cute.Tensor,
+        dq_acc: cute.Tensor,
+        gcur: cute.Tensor,
     ):
         d = self.d
         g = lane // 4
@@ -266,14 +424,34 @@ class AttnBwdSm120:
             if tidx == 0:
                 if it > 0:
                     # previous tile's staged dQ is complete, so issue its bulk reduce
-                    prow0, _ = self._q_row0(it - 1, n_q, q_start, b, hkv, h_q, h_kv, nq_pad)
-                    bulk_reduce_add_f32(gdq + Int64(prow0) * (d * 4),
-                                        sbase + self.dq_off + ((it - 1) % 2) * self.dq_stage_bytes,
-                                        self.dq_stage_bytes)
+                    prow0, _ = self._q_row0(
+                        it - 1, n_q, q_start, b, hkv, h_q, h_kv, nq_pad
+                    )
+                    bulk_reduce_add_f32(
+                        gdq + Int64(prow0) * (d * 4),
+                        sbase + self.dq_off + ((it - 1) % 2) * self.dq_stage_bytes,
+                        self.dq_stage_bytes,
+                    )
                     cute.arch.cp_async_bulk_commit_group()
                 # buffer `it % 2` is rewritten below, so wait for its last reader
                 cute.arch.cp_async_bulk_wait_group(1, read=True)
-        self._load_q(it + (self.stages - 1), total_it, n_q, q_start, b, hkv, h_q, h_kv, nq_pad, sbase, gq, gdo, gl, gd, tidx)
+        self._load_q(
+            it + (self.stages - 1),
+            total_it,
+            n_q,
+            q_start,
+            b,
+            hkv,
+            h_q,
+            h_kv,
+            nq_pad,
+            sbase,
+            gq,
+            gdo,
+            gl,
+            gd,
+            tidx,
+        )
         cute.arch.cp_async_commit_group()
 
         st = it % self.stages
@@ -289,7 +467,7 @@ class AttnBwdSm120:
         # power-of-two dS scale from the tile bound; all-zero tiles keep the old one
         g_t = ds_scale(tbound) if tbound > Float32(1e-30) else gc
         kappa = g_t * kc
-        dgam = g_t * Float32(2.0 ** -P_OFFSET)
+        dgam = g_t * Float32(2.0**-P_OFFSET)
 
         # `S^T = K_w Q^T`, `dP^T = V_w dO^T`, rows are this warp's 16 keys
         s_acc.fill(0.0)
@@ -306,15 +484,30 @@ class AttnBwdSm120:
                 b_o = ldsm_x4(ob + self._swz_off(brow, bch))
                 for h in cutlass.range_constexpr(2):
                     nt = 2 * npair + h
-                    c = mma_fp8(a_k, [b_q[2 * h], b_q[2 * h + 1]],
-                                [s_acc[4 * nt], s_acc[4 * nt + 1], s_acc[4 * nt + 2], s_acc[4 * nt + 3]])
+                    c = mma_fp8(
+                        a_k,
+                        [b_q[2 * h], b_q[2 * h + 1]],
+                        [
+                            s_acc[4 * nt],
+                            s_acc[4 * nt + 1],
+                            s_acc[4 * nt + 2],
+                            s_acc[4 * nt + 3],
+                        ],
+                    )
                     for x in cutlass.range_constexpr(4):
                         s_acc[4 * nt + x] = c[x]
-                    c = mma_fp8(a_v, [b_o[2 * h], b_o[2 * h + 1]],
-                                [dp_acc[4 * nt], dp_acc[4 * nt + 1], dp_acc[4 * nt + 2], dp_acc[4 * nt + 3]])
+                    c = mma_fp8(
+                        a_v,
+                        [b_o[2 * h], b_o[2 * h + 1]],
+                        [
+                            dp_acc[4 * nt],
+                            dp_acc[4 * nt + 1],
+                            dp_acc[4 * nt + 2],
+                            dp_acc[4 * nt + 3],
+                        ],
+                    )
                     for x in cutlass.range_constexpr(4):
                         dp_acc[4 * nt + x] = c[x]
-
 
         # `P8 = 2^(s*beta - L + 8)`, `dS*g = P8 * (dP*kappa - D*g*2^-8)`
         key0 = kblock * self.BC + warp * 16 + g
@@ -329,13 +522,18 @@ class AttnBwdSm120:
                 dq = d2[e] * dgam
                 for r in cutlass.range_constexpr(2):
                     idx = 4 * nt + 2 * r + e
-                    p8 = cute.math.exp2(s_acc[idx] * beta - lq + Float32(P_OFFSET), fastmath=True)
+                    p8 = cute.math.exp2(
+                        s_acc[idx] * beta - lq + Float32(P_OFFSET), fastmath=True
+                    )
                     p8 = p8 if key0 + 8 * r < seqlen_k else Float32(0.0)
                     if const_expr(self.causal):
-                        p8 = p8 if key0 + 8 * r <= qi * self.BM + q_loc + diag else Float32(0.0)
+                        p8 = (
+                            p8
+                            if key0 + 8 * r <= qi * self.BM + q_loc + diag
+                            else Float32(0.0)
+                        )
                     s_acc[idx] = p8
                     dp_acc[idx] = p8 * (dp_acc[idx] * kappa - dq)
-
 
         # dS to shared memory now; the fp32 S/dP fragments die once packed
         dsb = sbase + self.ds_off + (it % 2) * self.ds_bytes
@@ -347,23 +545,58 @@ class AttnBwdSm120:
                 for e in cutlass.range_constexpr(2):
                     q_loc = 8 * nt + 2 * t + e
                     a_lo = dsb + self._ds_off(q_loc, warp) + g
-                    st_shared_e4m3_pair(a_lo, a_lo + 8, dp_acc[4 * nt + e], dp_acc[4 * nt + 2 + e])
+                    st_shared_e4m3_pair(
+                        a_lo, a_lo + 8, dp_acc[4 * nt + e], dp_acc[4 * nt + 2 + e]
+                    )
             if const_expr(self.dq_wg):
                 cute.arch.mbarrier_arrive(self._ds_full + it % 2)
         for kk2 in cutlass.range_constexpr(self.BM // 32):
             t0 = 4 * kk2
-            pa_t[4 * kk2] = pack_e4m3x4(s_acc[4 * t0], s_acc[4 * t0 + 1], s_acc[4 * t0 + 4], s_acc[4 * t0 + 5])
-            pa_t[4 * kk2 + 1] = pack_e4m3x4(s_acc[4 * t0 + 2], s_acc[4 * t0 + 3], s_acc[4 * t0 + 6], s_acc[4 * t0 + 7])
-            pa_t[4 * kk2 + 2] = pack_e4m3x4(s_acc[4 * t0 + 8], s_acc[4 * t0 + 9], s_acc[4 * t0 + 12], s_acc[4 * t0 + 13])
-            pa_t[4 * kk2 + 3] = pack_e4m3x4(s_acc[4 * t0 + 10], s_acc[4 * t0 + 11], s_acc[4 * t0 + 14],
-                                            s_acc[4 * t0 + 15])
-            da_t[4 * kk2] = pack_e4m3x4(dp_acc[4 * t0], dp_acc[4 * t0 + 1], dp_acc[4 * t0 + 4], dp_acc[4 * t0 + 5])
-            da_t[4 * kk2 + 1] = pack_e4m3x4(dp_acc[4 * t0 + 2], dp_acc[4 * t0 + 3], dp_acc[4 * t0 + 6],
-                                            dp_acc[4 * t0 + 7])
-            da_t[4 * kk2 + 2] = pack_e4m3x4(dp_acc[4 * t0 + 8], dp_acc[4 * t0 + 9], dp_acc[4 * t0 + 12],
-                                            dp_acc[4 * t0 + 13])
-            da_t[4 * kk2 + 3] = pack_e4m3x4(dp_acc[4 * t0 + 10], dp_acc[4 * t0 + 11], dp_acc[4 * t0 + 14],
-                                            dp_acc[4 * t0 + 15])
+            pa_t[4 * kk2] = pack_e4m3x4(
+                s_acc[4 * t0], s_acc[4 * t0 + 1], s_acc[4 * t0 + 4], s_acc[4 * t0 + 5]
+            )
+            pa_t[4 * kk2 + 1] = pack_e4m3x4(
+                s_acc[4 * t0 + 2],
+                s_acc[4 * t0 + 3],
+                s_acc[4 * t0 + 6],
+                s_acc[4 * t0 + 7],
+            )
+            pa_t[4 * kk2 + 2] = pack_e4m3x4(
+                s_acc[4 * t0 + 8],
+                s_acc[4 * t0 + 9],
+                s_acc[4 * t0 + 12],
+                s_acc[4 * t0 + 13],
+            )
+            pa_t[4 * kk2 + 3] = pack_e4m3x4(
+                s_acc[4 * t0 + 10],
+                s_acc[4 * t0 + 11],
+                s_acc[4 * t0 + 14],
+                s_acc[4 * t0 + 15],
+            )
+            da_t[4 * kk2] = pack_e4m3x4(
+                dp_acc[4 * t0],
+                dp_acc[4 * t0 + 1],
+                dp_acc[4 * t0 + 4],
+                dp_acc[4 * t0 + 5],
+            )
+            da_t[4 * kk2 + 1] = pack_e4m3x4(
+                dp_acc[4 * t0 + 2],
+                dp_acc[4 * t0 + 3],
+                dp_acc[4 * t0 + 6],
+                dp_acc[4 * t0 + 7],
+            )
+            da_t[4 * kk2 + 2] = pack_e4m3x4(
+                dp_acc[4 * t0 + 8],
+                dp_acc[4 * t0 + 9],
+                dp_acc[4 * t0 + 12],
+                dp_acc[4 * t0 + 13],
+            )
+            da_t[4 * kk2 + 3] = pack_e4m3x4(
+                dp_acc[4 * t0 + 10],
+                dp_acc[4 * t0 + 11],
+                dp_acc[4 * t0 + 14],
+                dp_acc[4 * t0 + 15],
+            )
 
         # rescale dK to the new scale (exact, powers of two)
         if g_t != gc:
@@ -374,20 +607,46 @@ class AttnBwdSm120:
 
         # `dV += P^T dO`, `dK += dS^T Q`; B via transposing 8-bit `ldmatrix`
         for kk2 in cutlass.range_constexpr(self.BM // 32):
-            pa = [pa_t[4 * kk2], pa_t[4 * kk2 + 1], pa_t[4 * kk2 + 2], pa_t[4 * kk2 + 3]]
-            da = [da_t[4 * kk2], da_t[4 * kk2 + 1], da_t[4 * kk2 + 2], da_t[4 * kk2 + 3]]
+            pa = [
+                pa_t[4 * kk2],
+                pa_t[4 * kk2 + 1],
+                pa_t[4 * kk2 + 2],
+                pa_t[4 * kk2 + 3],
+            ]
+            da = [
+                da_t[4 * kk2],
+                da_t[4 * kk2 + 1],
+                da_t[4 * kk2 + 2],
+                da_t[4 * kk2 + 3],
+            ]
             qrow = v_row + 32 * kk2
             for npair in cutlass.range_constexpr(d // 16):
                 bo = ldsm_x2_trans_b8(ob + self._swz_off(qrow, npair))
                 bq = ldsm_x2_trans_b8(qb + self._swz_off(qrow, npair))
                 for h in cutlass.range_constexpr(2):
                     nt = 2 * npair + h
-                    c = mma_fp8(pa, [bo[h], bo[2 + h]],
-                                [dv_acc[4 * nt], dv_acc[4 * nt + 1], dv_acc[4 * nt + 2], dv_acc[4 * nt + 3]])
+                    c = mma_fp8(
+                        pa,
+                        [bo[h], bo[2 + h]],
+                        [
+                            dv_acc[4 * nt],
+                            dv_acc[4 * nt + 1],
+                            dv_acc[4 * nt + 2],
+                            dv_acc[4 * nt + 3],
+                        ],
+                    )
                     for x in cutlass.range_constexpr(4):
                         dv_acc[4 * nt + x] = c[x]
-                    c = mma_fp8(da, [bq[h], bq[2 + h]],
-                                [dk_acc[4 * nt], dk_acc[4 * nt + 1], dk_acc[4 * nt + 2], dk_acc[4 * nt + 3]])
+                    c = mma_fp8(
+                        da,
+                        [bq[h], bq[2 + h]],
+                        [
+                            dk_acc[4 * nt],
+                            dk_acc[4 * nt + 1],
+                            dk_acc[4 * nt + 2],
+                            dk_acc[4 * nt + 3],
+                        ],
+                    )
                     for x in cutlass.range_constexpr(4):
                         dk_acc[4 * nt + x] = c[x]
 
@@ -395,8 +654,17 @@ class AttnBwdSm120:
             self._dq(it, row0, sbase, dsb, gdq, warp, lane, dq_acc)
 
     @cute.jit
-    def _dq(self, it: Int32, row0: Int32, sbase: Int32, dsb: Int32, gdq: Int64, warp: Int32, lane: Int32,
-            dq_acc: cute.Tensor):
+    def _dq(
+        self,
+        it: Int32,
+        row0: Int32,
+        sbase: Int32,
+        dsb: Int32,
+        gdq: Int64,
+        warp: Int32,
+        lane: Int32,
+        dq_acc: cute.Tensor,
+    ):
         d = self.d
         g = lane // 4
         t = lane % 4
@@ -418,8 +686,16 @@ class AttnBwdSm120:
                 a = ldsm_x4(dsb + self._ds_off(arow, lane // 16 + 2 * ks))
                 bk = ldsm_x2_trans_b8(kb + self._swz_off(lane + 32 * ks, ch))
                 for h in cutlass.range_constexpr(2):
-                    c = mma_fp8(a, [bk[h], bk[2 + h]],
-                                [dq_acc[4 * h], dq_acc[4 * h + 1], dq_acc[4 * h + 2], dq_acc[4 * h + 3]])
+                    c = mma_fp8(
+                        a,
+                        [bk[h], bk[2 + h]],
+                        [
+                            dq_acc[4 * h],
+                            dq_acc[4 * h + 1],
+                            dq_acc[4 * h + 2],
+                            dq_acc[4 * h + 3],
+                        ],
+                    )
                     for x in cutlass.range_constexpr(4):
                         dq_acc[4 * h + x] = c[x]
             for h in cutlass.range_constexpr(2):
@@ -427,12 +703,18 @@ class AttnBwdSm120:
                     if const_expr(self.dq_bulk):
                         # conflict-free fragment order, undone by `BwdDqPost`
                         slot = (((warp * self.nb + i) * 2 + h) * 2 + r) * 32 + lane
-                        st_shared_v2_f32(sdq + slot * 8, dq_acc[4 * h + 2 * r], dq_acc[4 * h + 2 * r + 1])
+                        st_shared_v2_f32(
+                            sdq + slot * 8,
+                            dq_acc[4 * h + 2 * r],
+                            dq_acc[4 * h + 2 * r + 1],
+                        )
                     else:
                         q_loc = mt * 16 + g + 8 * r
                         col = ch * 16 + 8 * h + 2 * t
                         addr = gdq + (Int64(row0 + q_loc) * d + Int64(col)) * 4
-                        red_add_v2_f32(addr, dq_acc[4 * h + 2 * r], dq_acc[4 * h + 2 * r + 1])
+                        red_add_v2_f32(
+                            addr, dq_acc[4 * h + 2 * r], dq_acc[4 * h + 2 * r + 1]
+                        )
         if const_expr(self.dq_bulk):
             # make staging writes visible to the bulk-copy proxy
             cute.arch.fence_view_async_shared()
@@ -440,17 +722,52 @@ class AttnBwdSm120:
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor, mK: cute.Tensor, mV: cute.Tensor, mdO: cute.Tensor,
-        mL: cute.Tensor, mD: cute.Tensor, mTB: cute.Tensor, mStats: cute.Tensor, mDesc: cute.Tensor,
-        mdK: cute.Tensor, mdV: cute.Tensor, mdQacc: cute.Tensor, softmax_scale: Float32,
-        seqlen_q: Int32, seqlen_k: Int32, nq_pad: Int32, nk_pad: Int32, h_q: Int32, h_kv: Int32, batch: Int32,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mdO: cute.Tensor,
+        mL: cute.Tensor,
+        mD: cute.Tensor,
+        mTB: cute.Tensor,
+        mStats: cute.Tensor,
+        mDesc: cute.Tensor,
+        mdK: cute.Tensor,
+        mdV: cute.Tensor,
+        mdQacc: cute.Tensor,
+        softmax_scale: Float32,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        nq_pad: Int32,
+        nk_pad: Int32,
+        h_q: Int32,
+        h_kv: Int32,
+        batch: Int32,
     ):
         self.kernel(
-            mQ, mK, mV, mdO, mL, mD, mTB, mStats, mDesc, mdK, mdV, mdQacc, softmax_scale,
-            seqlen_q, seqlen_k, nq_pad, nk_pad, h_q, h_kv,
+            mQ,
+            mK,
+            mV,
+            mdO,
+            mL,
+            mD,
+            mTB,
+            mStats,
+            mDesc,
+            mdK,
+            mdV,
+            mdQacc,
+            softmax_scale,
+            seqlen_q,
+            seqlen_k,
+            nq_pad,
+            nk_pad,
+            h_q,
+            h_kv,
         ).launch(
             # key block is the slowest axis, so long causal CTAs launch first
-            grid=[h_kv * batch, nk_pad // self.BC, 1] if self.kb_major else [nk_pad // self.BC, h_kv, batch],
+            grid=[h_kv * batch, nk_pad // self.BC, 1]
+            if self.kb_major
+            else [nk_pad // self.BC, h_kv, batch],
             block=[self.threads, 1, 1],
             smem=self.shared_storage.size_in_bytes(),
             min_blocks_per_mp=self.min_blocks,
@@ -459,10 +776,25 @@ class AttnBwdSm120:
     @cute.kernel
     def kernel(
         self,
-        mQ: cute.Tensor, mK: cute.Tensor, mV: cute.Tensor, mdO: cute.Tensor,
-        mL: cute.Tensor, mD: cute.Tensor, mTB: cute.Tensor, mStats: cute.Tensor, mDesc: cute.Tensor,
-        mdK: cute.Tensor, mdV: cute.Tensor, mdQacc: cute.Tensor, softmax_scale: Float32,
-        seqlen_q: Int32, seqlen_k: Int32, nq_pad: Int32, nk_pad: Int32, h_q: Int32, h_kv: Int32,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mdO: cute.Tensor,
+        mL: cute.Tensor,
+        mD: cute.Tensor,
+        mTB: cute.Tensor,
+        mStats: cute.Tensor,
+        mDesc: cute.Tensor,
+        mdK: cute.Tensor,
+        mdV: cute.Tensor,
+        mdQacc: cute.Tensor,
+        softmax_scale: Float32,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        nq_pad: Int32,
+        nk_pad: Int32,
+        h_q: Int32,
+        h_kv: Int32,
     ):
         d = self.d
         tidx, _, _ = cute.arch.thread_idx()
@@ -478,7 +810,9 @@ class AttnBwdSm120:
         beta, kc, s_dk0, s_dv, _ = bwd_scales(mStats, mDesc, b, hkv, softmax_scale)
 
         storage = cutlass.utils.SmemAllocator().allocate(self.shared_storage)
-        sbase = Int32(storage.buf.get_tensor(cute.make_layout(self.smem_bytes)).iterator.toint())
+        sbase = Int32(
+            storage.buf.get_tensor(cute.make_layout(self.smem_bytes)).iterator.toint()
+        )
 
         k_row0 = (b * h_kv + hkv) * nk_pad + kblock * self.BC
         gk = Int64(mK.iterator.toint()) + Int64(k_row0) * d
@@ -508,36 +842,190 @@ class AttnBwdSm120:
                     cute.arch.mbarrier_init(self._ds_free + i, 128)
             cute.arch.mbarrier_init_fence()
             if warp < self.num_warps:
-                self._prologue(sbase, gk, gv, gq, gdo, gl, gd, total_it, n_q, q_start, b, hkv, h_q, h_kv, nq_pad, tidx)
+                self._prologue(
+                    sbase,
+                    gk,
+                    gv,
+                    gq,
+                    gdo,
+                    gl,
+                    gd,
+                    total_it,
+                    n_q,
+                    q_start,
+                    b,
+                    hkv,
+                    h_q,
+                    h_kv,
+                    nq_pad,
+                    tidx,
+                )
                 cute.arch.cp_async_wait_group(self.stages - 2)
             # K, V and the first query tile are visible to the dQ warps too
             cute.arch.sync_threads()
             if warp >= self.num_warps:
                 cute.arch.setmaxregister_decrease(self.DQ_REGS)
-                self._dq_loop(tidx, warp, lane, total_it, n_q, q_start, b, hkv, h_q, h_kv, nq_pad, sbase, gdq)
+                self._dq_loop(
+                    tidx,
+                    warp,
+                    lane,
+                    total_it,
+                    n_q,
+                    q_start,
+                    b,
+                    hkv,
+                    h_q,
+                    h_kv,
+                    nq_pad,
+                    sbase,
+                    gdq,
+                )
             else:
                 cute.arch.setmaxregister_increase(self.MMA_REGS)
-                self._main(tidx, warp, lane, kblock, hkv, b, total_it, n_q, q_start, h_q, h_kv, nq_pad, seqlen_q,
-                           seqlen_k, sbase, gq, gdo, gdq, gl, gd, beta, kc, s_dk0, s_dv, k_row0, mL, mD, mTB, mdK, mdV)
+                self._main(
+                    tidx,
+                    warp,
+                    lane,
+                    kblock,
+                    hkv,
+                    b,
+                    total_it,
+                    n_q,
+                    q_start,
+                    h_q,
+                    h_kv,
+                    nq_pad,
+                    seqlen_q,
+                    seqlen_k,
+                    sbase,
+                    gq,
+                    gdo,
+                    gdq,
+                    gl,
+                    gd,
+                    beta,
+                    kc,
+                    s_dk0,
+                    s_dv,
+                    k_row0,
+                    mL,
+                    mD,
+                    mTB,
+                    mdK,
+                    mdV,
+                )
         else:
-            self._prologue(sbase, gk, gv, gq, gdo, gl, gd, total_it, n_q, q_start, b, hkv, h_q, h_kv, nq_pad, tidx)
-            self._main(tidx, warp, lane, kblock, hkv, b, total_it, n_q, q_start, h_q, h_kv, nq_pad, seqlen_q,
-                       seqlen_k, sbase, gq, gdo, gdq, gl, gd, beta, kc, s_dk0, s_dv, k_row0, mL, mD, mTB, mdK, mdV)
+            self._prologue(
+                sbase,
+                gk,
+                gv,
+                gq,
+                gdo,
+                gl,
+                gd,
+                total_it,
+                n_q,
+                q_start,
+                b,
+                hkv,
+                h_q,
+                h_kv,
+                nq_pad,
+                tidx,
+            )
+            self._main(
+                tidx,
+                warp,
+                lane,
+                kblock,
+                hkv,
+                b,
+                total_it,
+                n_q,
+                q_start,
+                h_q,
+                h_kv,
+                nq_pad,
+                seqlen_q,
+                seqlen_k,
+                sbase,
+                gq,
+                gdo,
+                gdq,
+                gl,
+                gd,
+                beta,
+                kc,
+                s_dk0,
+                s_dv,
+                k_row0,
+                mL,
+                mD,
+                mTB,
+                mdK,
+                mdV,
+            )
 
     @cute.jit
-    def _prologue(self, sbase: Int32, gk: Int64, gv: Int64, gq: Int64, gdo: Int64, gl: Int64, gd: Int64,
-                  total_it: Int32, n_q: Int32, q_start: Int32, b: Int32, hkv: Int32, h_q: Int32, h_kv: Int32,
-                  nq_pad: Int32, tidx: Int32):
+    def _prologue(
+        self,
+        sbase: Int32,
+        gk: Int64,
+        gv: Int64,
+        gq: Int64,
+        gdo: Int64,
+        gl: Int64,
+        gd: Int64,
+        total_it: Int32,
+        n_q: Int32,
+        q_start: Int32,
+        b: Int32,
+        hkv: Int32,
+        h_q: Int32,
+        h_kv: Int32,
+        nq_pad: Int32,
+        tidx: Int32,
+    ):
         self._load_rows(sbase + self.k_off, gk, self.BC, tidx)
         self._load_rows(sbase + self.v_off, gv, self.BC, tidx)
         cute.arch.cp_async_commit_group()
         for s in cutlass.range_constexpr(self.stages - 1):
-            self._load_q(Int32(s), total_it, n_q, q_start, b, hkv, h_q, h_kv, nq_pad, sbase, gq, gdo, gl, gd, tidx)
+            self._load_q(
+                Int32(s),
+                total_it,
+                n_q,
+                q_start,
+                b,
+                hkv,
+                h_q,
+                h_kv,
+                nq_pad,
+                sbase,
+                gq,
+                gdo,
+                gl,
+                gd,
+                tidx,
+            )
             cute.arch.cp_async_commit_group()
 
     @cute.jit
-    def _dq_loop(self, tidx: Int32, warp: Int32, lane: Int32, total_it: Int32, n_q: Int32, q_start: Int32, b: Int32,
-                 hkv: Int32, h_q: Int32, h_kv: Int32, nq_pad: Int32, sbase: Int32, gdq: Int64):
+    def _dq_loop(
+        self,
+        tidx: Int32,
+        warp: Int32,
+        lane: Int32,
+        total_it: Int32,
+        n_q: Int32,
+        q_start: Int32,
+        b: Int32,
+        hkv: Int32,
+        h_q: Int32,
+        h_kv: Int32,
+        nq_pad: Int32,
+        sbase: Int32,
+        gdq: Int64,
+    ):
         d = self.d
         dwarp = warp - self.num_warps
         dtid = tidx - self.NUM_THREADS
@@ -548,10 +1036,14 @@ class AttnBwdSm120:
                 cute.arch.barrier(barrier_id=2, number_of_threads=128)
                 if dtid == 0:
                     if it > 0:
-                        prow0, _ = self._q_row0(it - 1, n_q, q_start, b, hkv, h_q, h_kv, nq_pad)
-                        bulk_reduce_add_f32(gdq + Int64(prow0) * (d * 4),
-                                            sbase + self.dq_off + ((it - 1) % 2) * self.dq_stage_bytes,
-                                            self.dq_stage_bytes)
+                        prow0, _ = self._q_row0(
+                            it - 1, n_q, q_start, b, hkv, h_q, h_kv, nq_pad
+                        )
+                        bulk_reduce_add_f32(
+                            gdq + Int64(prow0) * (d * 4),
+                            sbase + self.dq_off + ((it - 1) % 2) * self.dq_stage_bytes,
+                            self.dq_stage_bytes,
+                        )
                         cute.arch.cp_async_bulk_commit_group()
                     # buffer `it % 2` is rewritten below, so wait for its last reader
                     cute.arch.cp_async_bulk_wait_group(1, read=True)
@@ -565,19 +1057,53 @@ class AttnBwdSm120:
             cute.arch.barrier(barrier_id=2, number_of_threads=128)
             if dtid == 0:
                 if total_it > 0:
-                    lrow0, _ = self._q_row0(total_it - 1, n_q, q_start, b, hkv, h_q, h_kv, nq_pad)
-                    bulk_reduce_add_f32(gdq + Int64(lrow0) * (d * 4),
-                                        sbase + self.dq_off + ((total_it - 1) % 2) * self.dq_stage_bytes,
-                                        self.dq_stage_bytes)
+                    lrow0, _ = self._q_row0(
+                        total_it - 1, n_q, q_start, b, hkv, h_q, h_kv, nq_pad
+                    )
+                    bulk_reduce_add_f32(
+                        gdq + Int64(lrow0) * (d * 4),
+                        sbase
+                        + self.dq_off
+                        + ((total_it - 1) % 2) * self.dq_stage_bytes,
+                        self.dq_stage_bytes,
+                    )
                     cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
 
     @cute.jit
-    def _main(self, tidx: Int32, warp: Int32, lane: Int32, kblock: Int32, hkv: Int32, b: Int32, total_it: Int32,
-              n_q: Int32, q_start: Int32, h_q: Int32, h_kv: Int32, nq_pad: Int32, seqlen_q: Int32, seqlen_k: Int32,
-              sbase: Int32, gq: Int64, gdo: Int64, gdq: Int64, gl: Int64, gd: Int64, beta: Float32, kc: Float32,
-              s_dk0: Float32, s_dv: Float32, k_row0: Int32, mL: cute.Tensor, mD: cute.Tensor, mTB: cute.Tensor,
-              mdK: cute.Tensor, mdV: cute.Tensor):
+    def _main(
+        self,
+        tidx: Int32,
+        warp: Int32,
+        lane: Int32,
+        kblock: Int32,
+        hkv: Int32,
+        b: Int32,
+        total_it: Int32,
+        n_q: Int32,
+        q_start: Int32,
+        h_q: Int32,
+        h_kv: Int32,
+        nq_pad: Int32,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        sbase: Int32,
+        gq: Int64,
+        gdo: Int64,
+        gdq: Int64,
+        gl: Int64,
+        gd: Int64,
+        beta: Float32,
+        kc: Float32,
+        s_dk0: Float32,
+        s_dv: Float32,
+        k_row0: Int32,
+        mL: cute.Tensor,
+        mD: cute.Tensor,
+        mTB: cute.Tensor,
+        mdK: cute.Tensor,
+        mdV: cute.Tensor,
+    ):
         d = self.d
         g = lane // 4
         t = lane % 4
@@ -598,18 +1124,58 @@ class AttnBwdSm120:
         v_row = ((li % 4) // 2) * 8 + (li // 4) * 2 + (li % 2) + (lane // 16) * 16
 
         for it in cutlass.range(total_it, unroll=1):
-            self._iter(it, total_it, n_q, q_start, b, hkv, h_q, h_kv, nq_pad, seqlen_q, seqlen_k, kblock,
-                       sbase, gq, gdo, gdq, gl, gd, tidx, warp, lane, beta, kc, v_row,
-                       mL, mD, mTB, s_acc, dp_acc, pa_t, da_t, dk_acc, dv_acc, dq_acc, gcur)
+            self._iter(
+                it,
+                total_it,
+                n_q,
+                q_start,
+                b,
+                hkv,
+                h_q,
+                h_kv,
+                nq_pad,
+                seqlen_q,
+                seqlen_k,
+                kblock,
+                sbase,
+                gq,
+                gdo,
+                gdq,
+                gl,
+                gd,
+                tidx,
+                warp,
+                lane,
+                beta,
+                kc,
+                v_row,
+                mL,
+                mD,
+                mTB,
+                s_acc,
+                dp_acc,
+                pa_t,
+                da_t,
+                dk_acc,
+                dv_acc,
+                dq_acc,
+                gcur,
+            )
 
         if const_expr(self.dq_bulk and not self.skip_dq and not self.dq_wg):
             cute.arch.sync_threads()
             if tidx == 0:
                 if total_it > 0:
-                    lrow0, _ = self._q_row0(total_it - 1, n_q, q_start, b, hkv, h_q, h_kv, nq_pad)
-                    bulk_reduce_add_f32(gdq + Int64(lrow0) * (d * 4),
-                                        sbase + self.dq_off + ((total_it - 1) % 2) * self.dq_stage_bytes,
-                                        self.dq_stage_bytes)
+                    lrow0, _ = self._q_row0(
+                        total_it - 1, n_q, q_start, b, hkv, h_q, h_kv, nq_pad
+                    )
+                    bulk_reduce_add_f32(
+                        gdq + Int64(lrow0) * (d * 4),
+                        sbase
+                        + self.dq_off
+                        + ((total_it - 1) % 2) * self.dq_stage_bytes,
+                        self.dq_stage_bytes,
+                    )
                     cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
 
@@ -623,12 +1189,32 @@ class AttnBwdSm120:
                 krow = Int64(k_row0 + warp * 16 + g + 8 * r)
                 for nt in cutlass.range_constexpr(d // 8):
                     off = (krow * d + Int64(8 * nt + 2 * t)) * 2
-                    st_global_b32(gdk + off, pack_half2(dk_acc[4 * nt + 2 * r] * s_dk, dk_acc[4 * nt + 2 * r + 1] * s_dk, "bf16"))
-                    st_global_b32(gdv + off, pack_half2(dv_acc[4 * nt + 2 * r] * s_dv, dv_acc[4 * nt + 2 * r + 1] * s_dv, "bf16"))
+                    st_global_b32(
+                        gdk + off,
+                        pack_half2(
+                            dk_acc[4 * nt + 2 * r] * s_dk,
+                            dk_acc[4 * nt + 2 * r + 1] * s_dk,
+                            "bf16",
+                        ),
+                    )
+                    st_global_b32(
+                        gdv + off,
+                        pack_half2(
+                            dv_acc[4 * nt + 2 * r] * s_dv,
+                            dv_acc[4 * nt + 2 * r + 1] * s_dv,
+                            "bf16",
+                        ),
+                    )
 
 
 @cute.jit
-def bwd_scales(mStats: cute.Tensor, mDesc: cute.Tensor, b: Int32, hkv: Int32, softmax_scale: Float32):
+def bwd_scales(
+    mStats: cute.Tensor,
+    mDesc: cute.Tensor,
+    b: Int32,
+    hkv: Int32,
+    softmax_scale: Float32,
+):
     sig_q = mDesc[b, hkv, 0]
     sig_k = mDesc[b, hkv, 1]
     sig_v = mDesc[b, hkv, 2]
@@ -637,9 +1223,9 @@ def bwd_scales(mStats: cute.Tensor, mDesc: cute.Tensor, b: Int32, hkv: Int32, so
     # `(beta, kc, dK scale, dV scale, dQ scale)`; `kappa = kc * g_tile`
     return (
         softmax_scale * sig_q * sig_k * LOG2E,
-        s_do * sig_v * Float32(2.0 ** -P_OFFSET),
+        s_do * sig_v * Float32(2.0**-P_OFFSET),
         softmax_scale * sig_q,
-        s_do * Float32(2.0 ** -P_OFFSET),
+        s_do * Float32(2.0**-P_OFFSET),
         softmax_scale * sig_k,
     )
 
@@ -664,23 +1250,51 @@ class BwdDqPost:
         self.shared_storage = SharedStorage
 
     @cute.jit
-    def __call__(self, mAcc: cute.Tensor, mTB: cute.Tensor, mStats: cute.Tensor, mDesc: cute.Tensor,
-                 mdQ: cute.Tensor, softmax_scale: Float32, seqlen_q: Int32, nq_pad: Int32, h_q: Int32, h_kv: Int32,
-                 batch: Int32):
-        self.kernel(mAcc, mTB, mStats, mDesc, mdQ, softmax_scale, seqlen_q, nq_pad, h_q, h_kv).launch(
-            grid=[nq_pad // self.BM, h_q, batch], block=[self.NUM_THREADS, 1, 1],
-            smem=self.shared_storage.size_in_bytes() if const_expr(self.staged) else 0)
+    def __call__(
+        self,
+        mAcc: cute.Tensor,
+        mTB: cute.Tensor,
+        mStats: cute.Tensor,
+        mDesc: cute.Tensor,
+        mdQ: cute.Tensor,
+        softmax_scale: Float32,
+        seqlen_q: Int32,
+        nq_pad: Int32,
+        h_q: Int32,
+        h_kv: Int32,
+        batch: Int32,
+    ):
+        self.kernel(
+            mAcc, mTB, mStats, mDesc, mdQ, softmax_scale, seqlen_q, nq_pad, h_q, h_kv
+        ).launch(
+            grid=[nq_pad // self.BM, h_q, batch],
+            block=[self.NUM_THREADS, 1, 1],
+            smem=self.shared_storage.size_in_bytes() if const_expr(self.staged) else 0,
+        )
 
     @cute.kernel
-    def kernel(self, mAcc: cute.Tensor, mTB: cute.Tensor, mStats: cute.Tensor, mDesc: cute.Tensor,
-               mdQ: cute.Tensor, softmax_scale: Float32, seqlen_q: Int32, nq_pad: Int32, h_q: Int32, h_kv: Int32):
+    def kernel(
+        self,
+        mAcc: cute.Tensor,
+        mTB: cute.Tensor,
+        mStats: cute.Tensor,
+        mDesc: cute.Tensor,
+        mdQ: cute.Tensor,
+        softmax_scale: Float32,
+        seqlen_q: Int32,
+        nq_pad: Int32,
+        h_q: Int32,
+        h_kv: Int32,
+    ):
         d = self.d
         tidx, _, _ = cute.arch.thread_idx()
         tile, hq, b = cute.arch.block_idx()
         hkv = hq // (h_q // h_kv)
         _, _, _, _, s_dq0 = bwd_scales(mStats, mDesc, b, hkv, softmax_scale)
         # dS scale this tile was accumulated at, derived from the same bound
-        s_dq = s_dq0 * div_rn(Float32(1.0), ds_scale(mTB[(b * h_q + hq) * (nq_pad // self.BM) + tile]))
+        s_dq = s_dq0 * div_rn(
+            Float32(1.0), ds_scale(mTB[(b * h_q + hq) * (nq_pad // self.BM) + tile])
+        )
         acc0 = ((b * h_q + hq) * nq_pad + tile * self.BM) * d
         gout = Int64(mdQ.iterator.toint())
         dchunks = d // 16
@@ -712,7 +1326,9 @@ class BwdDqPost:
                 x1 = mAcc[acc0 + 2 * p + 1]
             qg = tile * self.BM + q_loc
             if qg < seqlen_q:
-                addr = gout + (Int64((b * h_q + hq) * seqlen_q + qg) * d + Int64(col)) * 2
+                addr = (
+                    gout + (Int64((b * h_q + hq) * seqlen_q + qg) * d + Int64(col)) * 2
+                )
                 st_global_b32(addr, pack_half2(x0 * s_dq, x1 * s_dq, "bf16"))
 
 
@@ -721,7 +1337,9 @@ class AttnBwdDqSm120:
     BN = 64
     NUM_THREADS = 256
 
-    def __init__(self, head_dim: int, causal: bool, tb_block_m: int, num_stages: int = 2):
+    def __init__(
+        self, head_dim: int, causal: bool, tb_block_m: int, num_stages: int = 2
+    ):
         assert head_dim in (64, 128)
         self.tb_block_m = tb_block_m
         self.d = head_dim
@@ -753,23 +1371,60 @@ class AttnBwdDqSm120:
             idx = tidx + i * self.NUM_THREADS
             row = idx // chunks
             ch = idx % chunks
-            cp_async16(s_addr + self._swz_off(row, ch), g_addr + Int64(row * self.d + ch * 16))
+            cp_async16(
+                s_addr + self._swz_off(row, ch), g_addr + Int64(row * self.d + ch * 16)
+            )
 
     @cute.jit
-    def _load_tile(self, jn: Int32, n_blocks: Int32, sbase: Int32, gk: Int64, gv: Int64, tidx: Int32):
+    def _load_tile(
+        self,
+        jn: Int32,
+        n_blocks: Int32,
+        sbase: Int32,
+        gk: Int64,
+        gv: Int64,
+        tidx: Int32,
+    ):
         if jn < n_blocks:
             sn = jn % self.stages
-            self._load_rows(sbase + self.k_off + sn * self.kv_tile_bytes,
-                            gk + Int64(jn) * (self.BN * self.d), self.BN, tidx)
-            self._load_rows(sbase + self.v_off + sn * self.kv_tile_bytes,
-                            gv + Int64(jn) * (self.BN * self.d), self.BN, tidx)
+            self._load_rows(
+                sbase + self.k_off + sn * self.kv_tile_bytes,
+                gk + Int64(jn) * (self.BN * self.d),
+                self.BN,
+                tidx,
+            )
+            self._load_rows(
+                sbase + self.v_off + sn * self.kv_tile_bytes,
+                gv + Int64(jn) * (self.BN * self.d),
+                self.BN,
+                tidx,
+            )
 
     @cute.jit
     def _tile(
-        self, j: Int32, n_blocks: Int32, sbase: Int32, gk: Int64, gv: Int64, tidx: Int32, lane: Int32, t: Int32,
-        beta: Float32, kappa: Float32, l0: Float32, l1: Float32, dk0: Float32, dk1: Float32,
-        lim0: Int32, lim1: Int32, v_key: Int32,
-        qf: cute.Tensor, of: cute.Tensor, s_acc: cute.Tensor, dp_acc: cute.Tensor, dq_acc: cute.Tensor,
+        self,
+        j: Int32,
+        n_blocks: Int32,
+        sbase: Int32,
+        gk: Int64,
+        gv: Int64,
+        tidx: Int32,
+        lane: Int32,
+        t: Int32,
+        beta: Float32,
+        kappa: Float32,
+        l0: Float32,
+        l1: Float32,
+        dk0: Float32,
+        dk1: Float32,
+        lim0: Int32,
+        lim1: Int32,
+        v_key: Int32,
+        qf: cute.Tensor,
+        of: cute.Tensor,
+        s_acc: cute.Tensor,
+        dp_acc: cute.Tensor,
+        dq_acc: cute.Tensor,
     ):
         d = self.d
         cute.arch.cp_async_wait_group(self.stages - 2)
@@ -790,14 +1445,28 @@ class AttnBwdDqSm120:
                 bv = ldsm_x4(vbase + self._swz_off(key, ch))
                 for h in cutlass.range_constexpr(2):
                     nt = 2 * npair + h
-                    c = mma_fp8([qf[4 * kk], qf[4 * kk + 1], qf[4 * kk + 2], qf[4 * kk + 3]],
-                                [bk[2 * h], bk[2 * h + 1]],
-                                [s_acc[4 * nt], s_acc[4 * nt + 1], s_acc[4 * nt + 2], s_acc[4 * nt + 3]])
+                    c = mma_fp8(
+                        [qf[4 * kk], qf[4 * kk + 1], qf[4 * kk + 2], qf[4 * kk + 3]],
+                        [bk[2 * h], bk[2 * h + 1]],
+                        [
+                            s_acc[4 * nt],
+                            s_acc[4 * nt + 1],
+                            s_acc[4 * nt + 2],
+                            s_acc[4 * nt + 3],
+                        ],
+                    )
                     for x in cutlass.range_constexpr(4):
                         s_acc[4 * nt + x] = c[x]
-                    c = mma_fp8([of[4 * kk], of[4 * kk + 1], of[4 * kk + 2], of[4 * kk + 3]],
-                                [bv[2 * h], bv[2 * h + 1]],
-                                [dp_acc[4 * nt], dp_acc[4 * nt + 1], dp_acc[4 * nt + 2], dp_acc[4 * nt + 3]])
+                    c = mma_fp8(
+                        [of[4 * kk], of[4 * kk + 1], of[4 * kk + 2], of[4 * kk + 3]],
+                        [bv[2 * h], bv[2 * h + 1]],
+                        [
+                            dp_acc[4 * nt],
+                            dp_acc[4 * nt + 1],
+                            dp_acc[4 * nt + 2],
+                            dp_acc[4 * nt + 3],
+                        ],
+                    )
                     for x in cutlass.range_constexpr(4):
                         dp_acc[4 * nt + x] = c[x]
 
@@ -810,7 +1479,9 @@ class AttnBwdDqSm120:
             for nt in cutlass.range_constexpr(self.nt):
                 for e in cutlass.range_constexpr(2):
                     idx = 4 * nt + 2 * r + e
-                    p8 = cute.math.exp2(s_acc[idx] * beta - lq + Float32(P_OFFSET), fastmath=True)
+                    p8 = cute.math.exp2(
+                        s_acc[idx] * beta - lq + Float32(P_OFFSET), fastmath=True
+                    )
                     p8 = p8 if kb + (8 * nt + e) < lim else Float32(0.0)
                     dp_acc[idx] = p8 * (dp_acc[idx] * kappa - dq)
 
@@ -818,32 +1489,89 @@ class AttnBwdDqSm120:
         for kk2 in cutlass.range_constexpr(self.BN // 32):
             t0 = 4 * kk2
             da = [
-                pack_e4m3x4(dp_acc[4 * t0], dp_acc[4 * t0 + 1], dp_acc[4 * t0 + 4], dp_acc[4 * t0 + 5]),
-                pack_e4m3x4(dp_acc[4 * t0 + 2], dp_acc[4 * t0 + 3], dp_acc[4 * t0 + 6], dp_acc[4 * t0 + 7]),
-                pack_e4m3x4(dp_acc[4 * t0 + 8], dp_acc[4 * t0 + 9], dp_acc[4 * t0 + 12], dp_acc[4 * t0 + 13]),
-                pack_e4m3x4(dp_acc[4 * t0 + 10], dp_acc[4 * t0 + 11], dp_acc[4 * t0 + 14], dp_acc[4 * t0 + 15]),
+                pack_e4m3x4(
+                    dp_acc[4 * t0],
+                    dp_acc[4 * t0 + 1],
+                    dp_acc[4 * t0 + 4],
+                    dp_acc[4 * t0 + 5],
+                ),
+                pack_e4m3x4(
+                    dp_acc[4 * t0 + 2],
+                    dp_acc[4 * t0 + 3],
+                    dp_acc[4 * t0 + 6],
+                    dp_acc[4 * t0 + 7],
+                ),
+                pack_e4m3x4(
+                    dp_acc[4 * t0 + 8],
+                    dp_acc[4 * t0 + 9],
+                    dp_acc[4 * t0 + 12],
+                    dp_acc[4 * t0 + 13],
+                ),
+                pack_e4m3x4(
+                    dp_acc[4 * t0 + 10],
+                    dp_acc[4 * t0 + 11],
+                    dp_acc[4 * t0 + 14],
+                    dp_acc[4 * t0 + 15],
+                ),
             ]
             key = v_key + 32 * kk2
             for npair in cutlass.range_constexpr(d // 16):
                 bk = ldsm_x2_trans_b8(kbase + self._swz_off(key, npair))
                 for h in cutlass.range_constexpr(2):
                     nt = 2 * npair + h
-                    c = mma_fp8(da, [bk[h], bk[2 + h]],
-                                [dq_acc[4 * nt], dq_acc[4 * nt + 1], dq_acc[4 * nt + 2], dq_acc[4 * nt + 3]])
+                    c = mma_fp8(
+                        da,
+                        [bk[h], bk[2 + h]],
+                        [
+                            dq_acc[4 * nt],
+                            dq_acc[4 * nt + 1],
+                            dq_acc[4 * nt + 2],
+                            dq_acc[4 * nt + 3],
+                        ],
+                    )
                     for x in cutlass.range_constexpr(4):
                         dq_acc[4 * nt + x] = c[x]
 
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor, mK: cute.Tensor, mV: cute.Tensor, mdO: cute.Tensor,
-        mL: cute.Tensor, mD: cute.Tensor, mTB: cute.Tensor, mStats: cute.Tensor, mDesc: cute.Tensor,
-        mdQ: cute.Tensor, softmax_scale: Float32, seqlen_q: Int32, seqlen_k: Int32, nq_pad: Int32, nk_pad: Int32,
-        h_q: Int32, h_kv: Int32, batch: Int32,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mdO: cute.Tensor,
+        mL: cute.Tensor,
+        mD: cute.Tensor,
+        mTB: cute.Tensor,
+        mStats: cute.Tensor,
+        mDesc: cute.Tensor,
+        mdQ: cute.Tensor,
+        softmax_scale: Float32,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        nq_pad: Int32,
+        nk_pad: Int32,
+        h_q: Int32,
+        h_kv: Int32,
+        batch: Int32,
     ):
         self.kernel(
-            mQ, mK, mV, mdO, mL, mD, mTB, mStats, mDesc, mdQ, softmax_scale,
-            seqlen_q, seqlen_k, nq_pad, nk_pad, h_q, h_kv,
+            mQ,
+            mK,
+            mV,
+            mdO,
+            mL,
+            mD,
+            mTB,
+            mStats,
+            mDesc,
+            mdQ,
+            softmax_scale,
+            seqlen_q,
+            seqlen_k,
+            nq_pad,
+            nk_pad,
+            h_q,
+            h_kv,
         ).launch(
             grid=[nq_pad // self.BM, h_q, batch],
             block=[self.NUM_THREADS, 1, 1],
@@ -854,10 +1582,23 @@ class AttnBwdDqSm120:
     @cute.kernel
     def kernel(
         self,
-        mQ: cute.Tensor, mK: cute.Tensor, mV: cute.Tensor, mdO: cute.Tensor,
-        mL: cute.Tensor, mD: cute.Tensor, mTB: cute.Tensor, mStats: cute.Tensor, mDesc: cute.Tensor,
-        mdQ: cute.Tensor, softmax_scale: Float32, seqlen_q: Int32, seqlen_k: Int32, nq_pad: Int32, nk_pad: Int32,
-        h_q: Int32, h_kv: Int32,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mdO: cute.Tensor,
+        mL: cute.Tensor,
+        mD: cute.Tensor,
+        mTB: cute.Tensor,
+        mStats: cute.Tensor,
+        mDesc: cute.Tensor,
+        mdQ: cute.Tensor,
+        softmax_scale: Float32,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        nq_pad: Int32,
+        nk_pad: Int32,
+        h_q: Int32,
+        h_kv: Int32,
     ):
         d = self.d
         kq_steps = d // 32
@@ -871,7 +1612,9 @@ class AttnBwdDqSm120:
         beta, kc, _, _, s_dq0 = bwd_scales(mStats, mDesc, b, hkv, softmax_scale)
 
         storage = cutlass.utils.SmemAllocator().allocate(self.shared_storage)
-        sbase = Int32(storage.buf.get_tensor(cute.make_layout(self.smem_bytes)).iterator.toint())
+        sbase = Int32(
+            storage.buf.get_tensor(cute.make_layout(self.smem_bytes)).iterator.toint()
+        )
 
         q_row0 = (b * h_q + hq) * nq_pad + m_block * self.BM
         k_row0 = (b * h_kv + hkv) * nk_pad
@@ -912,9 +1655,11 @@ class AttnBwdDqSm120:
         l1 = mL[lrow + 8]
         # the warp's 16 query rows share one prep tile, so the dS scale is fixed over the key loop
         tq = m_block * self.BM + warp * 16
-        gq_s = ds_scale(mTB[(b * h_q + hq) * (nq_pad // self.tb_block_m) + tq // self.tb_block_m])
+        gq_s = ds_scale(
+            mTB[(b * h_q + hq) * (nq_pad // self.tb_block_m) + tq // self.tb_block_m]
+        )
         kappa = gq_s * kc
-        dgam = gq_s * Float32(2.0 ** -P_OFFSET)
+        dgam = gq_s * Float32(2.0**-P_OFFSET)
         s_dq = s_dq0 * div_rn(Float32(1.0), gq_s)
         dk0 = mD[lrow] * dgam
         dk1 = mD[lrow + 8] * dgam
@@ -934,8 +1679,30 @@ class AttnBwdDqSm120:
         dq_acc = cute.make_rmem_tensor(4 * (d // 8), Float32)
         dq_acc.fill(0.0)
         for j in cutlass.range(n_blocks, unroll=1):
-            self._tile(j, n_blocks, sbase, gk, gv, tidx, lane, t, beta, kappa, l0, l1, dk0, dk1,
-                       lim0, lim1, v_key, qf, of, s_acc, dp_acc, dq_acc)
+            self._tile(
+                j,
+                n_blocks,
+                sbase,
+                gk,
+                gv,
+                tidx,
+                lane,
+                t,
+                beta,
+                kappa,
+                l0,
+                l1,
+                dk0,
+                dk1,
+                lim0,
+                lim1,
+                v_key,
+                qf,
+                of,
+                s_acc,
+                dp_acc,
+                dq_acc,
+            )
 
         gdq = Int64(mdQ.iterator.toint())
         for r in cutlass.range_constexpr(2):
@@ -943,13 +1710,38 @@ class AttnBwdDqSm120:
                 orow = Int64(lrow + 8 * r)
                 for nt in cutlass.range_constexpr(d // 8):
                     addr = gdq + (orow * d + Int64(8 * nt + 2 * t)) * 2
-                    st_global_b32(addr, pack_half2(dq_acc[4 * nt + 2 * r] * s_dq, dq_acc[4 * nt + 2 * r + 1] * s_dq, "bf16"))
+                    st_global_b32(
+                        addr,
+                        pack_half2(
+                            dq_acc[4 * nt + 2 * r] * s_dq,
+                            dq_acc[4 * nt + 2 * r + 1] * s_dq,
+                            "bf16",
+                        ),
+                    )
 
 
-def make_attn_bwd(q, k, v, out, lse, pmax, dout, q_descale=None, k_descale=None, v_descale=None,
-                      causal=False, softmax_scale=None, num_stages=None, dq_bulk=None,
-                      deterministic=False, num_warps=8, block_m=None, min_blocks=None, kb_major=None,
-                      dq_wg=None):
+def make_attn_bwd(
+    q,
+    k,
+    v,
+    out,
+    lse,
+    pmax,
+    dout,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    causal=False,
+    softmax_scale=None,
+    num_stages=None,
+    dq_bulk=None,
+    deterministic=False,
+    num_warps=8,
+    block_m=None,
+    min_blocks=None,
+    kb_major=None,
+    dq_wg=None,
+):
     """Prepare the attention backward on SM120.
 
     Args:
@@ -991,12 +1783,18 @@ def make_attn_bwd(q, k, v, out, lse, pmax, dout, q_descale=None, k_descale=None,
         kb_major = causal
     dev = q.device
     ones = torch.ones(B, Hkv, dtype=torch.float32, device=dev)
-    sq, sk, sv = [(x if x is not None else ones).float() for x in (q_descale, k_descale, v_descale)]
+    sq, sk, sv = [
+        (x if x is not None else ones).float()
+        for x in (q_descale, k_descale, v_descale)
+    ]
     desc = torch.stack([sq, sk, sv], dim=-1).contiguous()
     from_cache = num_stages is None and dq_bulk is None and block_m is None
     if num_stages is None or dq_bulk is None or block_m is None:
         tuned = tune_lookup(tune_key("bwd", d, causal, Nq, Nk, Hq // Hkv)) or {
-            "num_stages": 2, "dq_bulk": causal or d != 128, "block_m": 32 if d == 128 else 64}
+            "num_stages": 2,
+            "dq_bulk": causal or d != 128,
+            "block_m": 32 if d == 128 else 64,
+        }
         num_stages = tuned["num_stages"] if num_stages is None else num_stages
         dq_bulk = tuned["dq_bulk"] if dq_bulk is None else dq_bulk
         block_m = tuned["block_m"] if block_m is None else block_m
@@ -1004,7 +1802,11 @@ def make_attn_bwd(q, k, v, out, lse, pmax, dout, q_descale=None, k_descale=None,
             dq_wg = tuned.get("dq_wg", False)
     if min_blocks is None:
         # never reuse a cached `min_blocks` with a config it was not tuned for
-        tuned = (tune_lookup(tune_key("bwd", d, causal, Nq, Nk, Hq // Hkv)) or {}) if from_cache else {}
+        tuned = (
+            (tune_lookup(tune_key("bwd", d, causal, Nq, Nk, Hq // Hkv)) or {})
+            if from_cache
+            else {}
+        )
         min_blocks = tuned.get("min_blocks", 0)
     if deterministic or num_warps == 4:
         dq_bulk = False
@@ -1018,45 +1820,145 @@ def make_attn_bwd(q, k, v, out, lse, pmax, dout, q_descale=None, k_descale=None,
     kp = pad_rows(k.view(torch.uint8), nk_pad)
     vp = pad_rows(v.view(torch.uint8), nk_pad)
     lp = pad_rows(lse.float(), nq_pad, value=math.inf)
-    dout_c, out_c, pmax_c = dout.to(torch.bfloat16).contiguous(), out.to(torch.bfloat16).contiguous(), pmax.float().contiguous()
-    do8 = (torch.zeros if nq_pad != Nq else torch.empty)(B, Hq, nq_pad, d, dtype=torch.uint8, device=dev)
+    dout_c, out_c, pmax_c = (
+        dout.to(torch.bfloat16).contiguous(),
+        out.to(torch.bfloat16).contiguous(),
+        pmax.float().contiguous(),
+    )
+    do8 = (torch.zeros if nq_pad != Nq else torch.empty)(
+        B, Hq, nq_pad, d, dtype=torch.uint8, device=dev
+    )
     dvec = torch.zeros(B, Hq, nq_pad, dtype=torch.float32, device=dev)
     # per (batch, kv head) stats `[dO amax, unused, max |V|, unused]`, then per-query-tile dS bounds
     n_stats = B * Hkv * 4
-    stats_buf = torch.zeros(n_stats + B * Hq * (nq_pad // block_m), dtype=torch.float32, device=dev)
+    stats_buf = torch.zeros(
+        n_stats + B * Hq * (nq_pad // block_m), dtype=torch.float32, device=dev
+    )
     stats, tb = stats_buf[:n_stats].view(B, Hkv, 4), stats_buf[n_stats:]
     stats_init = torch.zeros_like(stats_buf)
-    stats_init[:n_stats].view(B, Hkv, 4)[:, :, 2] = (v.float() * sv[:, :, None, None]).norm(dim=-1).amax(dim=2)
+    stats_init[:n_stats].view(B, Hkv, 4)[:, :, 2] = (
+        (v.float() * sv[:, :, None, None]).norm(dim=-1).amax(dim=2)
+    )
     dk_out = torch.empty(B, Hkv, nk_pad, d, dtype=torch.bfloat16, device=dev)
     dv_out = torch.empty(B, Hkv, nk_pad, d, dtype=torch.bfloat16, device=dev)
 
     run_main_dq = not deterministic
-    dq_acc = torch.empty(B, Hq, nq_pad, d, dtype=torch.float32, device=dev) if run_main_dq else None
-    prep_args = [flat(dout_c), flat(out_c), flat(pmax_c), flat(do8), flat(dvec), flat(tb), from_dlpack(stats),
-                 flat(dq_acc if dq_acc is not None else dvec),
-                 Int32(B * Hq * Nq), Int32(Nq), Int32(nq_pad), Int32(Hq), Int32(Hkv)]
-    prep = compile_cached(BwdPrep, (d, dq_acc is not None, block_m), (str(dout_c.dtype), B, Hq, Hkv, Nq, nq_pad), *prep_args)
+    dq_acc = (
+        torch.empty(B, Hq, nq_pad, d, dtype=torch.float32, device=dev)
+        if run_main_dq
+        else None
+    )
+    prep_args = [
+        flat(dout_c),
+        flat(out_c),
+        flat(pmax_c),
+        flat(do8),
+        flat(dvec),
+        flat(tb),
+        from_dlpack(stats),
+        flat(dq_acc if dq_acc is not None else dvec),
+        Int32(B * Hq * Nq),
+        Int32(Nq),
+        Int32(nq_pad),
+        Int32(Hq),
+        Int32(Hkv),
+    ]
+    prep = compile_cached(
+        BwdPrep,
+        (d, dq_acc is not None, block_m),
+        (str(dout_c.dtype), B, Hq, Hkv, Nq, nq_pad),
+        *prep_args,
+    )
 
     if deterministic:
         dq_out = torch.empty(B, Hq, nq_pad, d, dtype=torch.bfloat16, device=dev)
-        dqk_args = [flat(qp), flat(kp), flat(vp), flat(do8), flat(lp), flat(dvec), flat(tb),
-                    from_dlpack(stats), from_dlpack(desc), flat(dq_out), Float32(softmax_scale),
-                    Int32(Nq), Int32(Nk), Int32(nq_pad), Int32(nk_pad), Int32(Hq), Int32(Hkv), Int32(B)]
-        dqk = compile_cached(AttnBwdDqSm120, (d, causal, block_m), (B, Hq, Hkv, nq_pad, nk_pad), *dqk_args)
+        dqk_args = [
+            flat(qp),
+            flat(kp),
+            flat(vp),
+            flat(do8),
+            flat(lp),
+            flat(dvec),
+            flat(tb),
+            from_dlpack(stats),
+            from_dlpack(desc),
+            flat(dq_out),
+            Float32(softmax_scale),
+            Int32(Nq),
+            Int32(Nk),
+            Int32(nq_pad),
+            Int32(nk_pad),
+            Int32(Hq),
+            Int32(Hkv),
+            Int32(B),
+        ]
+        dqk = compile_cached(
+            AttnBwdDqSm120,
+            (d, causal, block_m),
+            (B, Hq, Hkv, nq_pad, nk_pad),
+            *dqk_args,
+        )
     else:
         dq_out = torch.empty(B, Hq, Nq, d, dtype=torch.bfloat16, device=dev)
-        post_args = [flat(dq_acc), flat(tb), from_dlpack(stats), from_dlpack(desc), flat(dq_out), Float32(softmax_scale),
-                     Int32(Nq), Int32(nq_pad), Int32(Hq), Int32(Hkv), Int32(B)]
-        post = compile_cached(BwdDqPost, (d, block_m, dq_bulk, 4 if dq_wg else num_warps), (B, Hq, Hkv, Nq, nq_pad),
-                         *post_args)
+        post_args = [
+            flat(dq_acc),
+            flat(tb),
+            from_dlpack(stats),
+            from_dlpack(desc),
+            flat(dq_out),
+            Float32(softmax_scale),
+            Int32(Nq),
+            Int32(nq_pad),
+            Int32(Hq),
+            Int32(Hkv),
+            Int32(B),
+        ]
+        post = compile_cached(
+            BwdDqPost,
+            (d, block_m, dq_bulk, 4 if dq_wg else num_warps),
+            (B, Hq, Hkv, Nq, nq_pad),
+            *post_args,
+        )
 
-    main_args = [flat(qp), flat(kp), flat(vp), flat(do8), flat(lp), flat(dvec), flat(tb), from_dlpack(stats),
-                 from_dlpack(desc), flat(dk_out), flat(dv_out),
-                 flat(dq_acc if dq_acc is not None else dvec), Float32(softmax_scale),
-                 Int32(Nq), Int32(Nk), Int32(nq_pad), Int32(nk_pad), Int32(Hq), Int32(Hkv), Int32(B)]
-    main = compile_cached(AttnBwdSm120, (d, causal, block_m, num_stages, not run_main_dq, dq_bulk, num_warps, min_blocks,
-                                       kb_major, dq_wg),
-                     (B, Hq, Hkv, nq_pad, nk_pad), *main_args)
+    main_args = [
+        flat(qp),
+        flat(kp),
+        flat(vp),
+        flat(do8),
+        flat(lp),
+        flat(dvec),
+        flat(tb),
+        from_dlpack(stats),
+        from_dlpack(desc),
+        flat(dk_out),
+        flat(dv_out),
+        flat(dq_acc if dq_acc is not None else dvec),
+        Float32(softmax_scale),
+        Int32(Nq),
+        Int32(Nk),
+        Int32(nq_pad),
+        Int32(nk_pad),
+        Int32(Hq),
+        Int32(Hkv),
+        Int32(B),
+    ]
+    main = compile_cached(
+        AttnBwdSm120,
+        (
+            d,
+            causal,
+            block_m,
+            num_stages,
+            not run_main_dq,
+            dq_bulk,
+            num_warps,
+            min_blocks,
+            kb_major,
+            dq_wg,
+        ),
+        (B, Hq, Hkv, nq_pad, nk_pad),
+        *main_args,
+    )
 
     def launch():
         # prep zeroes all `dQaccum` rows; padded rows of a partial tile hold pieces of valid rows
@@ -1081,9 +1983,28 @@ def make_attn_bwd(q, k, v, out, lse, pmax, dout, q_descale=None, k_descale=None,
     return launch, finish
 
 
-def attn_bwd(q, k, v, out, lse, pmax, dout, q_descale=None, k_descale=None, v_descale=None,
-                 causal=False, softmax_scale=None, num_stages=None, dq_bulk=None, deterministic=False, num_warps=8,
-                 block_m=None, min_blocks=None, kb_major=None, dq_wg=None):
+def attn_bwd(
+    q,
+    k,
+    v,
+    out,
+    lse,
+    pmax,
+    dout,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    causal=False,
+    softmax_scale=None,
+    num_stages=None,
+    dq_bulk=None,
+    deterministic=False,
+    num_warps=8,
+    block_m=None,
+    min_blocks=None,
+    kb_major=None,
+    dq_wg=None,
+):
     """Run the attention backward once.
 
     Args:
@@ -1111,26 +2032,79 @@ def attn_bwd(q, k, v, out, lse, pmax, dout, q_descale=None, k_descale=None, v_de
     Returns:
         ``(dq, dk, dv)`` in bf16.
     """
-    launch, finish = make_attn_bwd(q, k, v, out, lse, pmax, dout, q_descale, k_descale, v_descale,
-                                       causal, softmax_scale, num_stages, dq_bulk=dq_bulk,
-                                       deterministic=deterministic, num_warps=num_warps, block_m=block_m,
-                                       min_blocks=min_blocks, kb_major=kb_major, dq_wg=dq_wg)
+    launch, finish = make_attn_bwd(
+        q,
+        k,
+        v,
+        out,
+        lse,
+        pmax,
+        dout,
+        q_descale,
+        k_descale,
+        v_descale,
+        causal,
+        softmax_scale,
+        num_stages,
+        dq_bulk=dq_bulk,
+        deterministic=deterministic,
+        num_warps=num_warps,
+        block_m=block_m,
+        min_blocks=min_blocks,
+        kb_major=kb_major,
+        dq_wg=dq_wg,
+    )
     launch()
     return finish()
 
 
 BWD_CANDIDATES = {
-    128: [{"block_m": 32, "num_stages": st, "dq_bulk": bulk} for st in (2, 3) for bulk in (False, True)]
-         + [{"block_m": 32, "num_stages": st, "dq_bulk": bulk, "dq_wg": True} for st in (2, 3) for bulk in (False, True)],
-    64: [{"block_m": bm, "num_stages": st, "dq_bulk": bulk} for bm in (32, 64) for st in (2, 3) for bulk in (False, True)]
-        + [{"block_m": 32, "num_stages": 2, "dq_bulk": bulk, "min_blocks": 2} for bulk in (False, True)]
-        + [{"block_m": bm, "num_stages": st, "dq_bulk": bulk, "dq_wg": True} for bm in (32, 64) for st in (2, 3)
-           for bulk in (False, True)],
+    128: [
+        {"block_m": 32, "num_stages": st, "dq_bulk": bulk}
+        for st in (2, 3)
+        for bulk in (False, True)
+    ]
+    + [
+        {"block_m": 32, "num_stages": st, "dq_bulk": bulk, "dq_wg": True}
+        for st in (2, 3)
+        for bulk in (False, True)
+    ],
+    64: [
+        {"block_m": bm, "num_stages": st, "dq_bulk": bulk}
+        for bm in (32, 64)
+        for st in (2, 3)
+        for bulk in (False, True)
+    ]
+    + [
+        {"block_m": 32, "num_stages": 2, "dq_bulk": bulk, "min_blocks": 2}
+        for bulk in (False, True)
+    ]
+    + [
+        {"block_m": bm, "num_stages": st, "dq_bulk": bulk, "dq_wg": True}
+        for bm in (32, 64)
+        for st in (2, 3)
+        for bulk in (False, True)
+    ],
 }
 
 
-def autotune_attn_bwd(q, k, v, out, lse, pmax, dout, q_descale=None, k_descale=None, v_descale=None,
-                          causal=False, softmax_scale=None, candidates=None, iters=10, verbose=True):
+def autotune_attn_bwd(
+    q,
+    k,
+    v,
+    out,
+    lse,
+    pmax,
+    dout,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    causal=False,
+    softmax_scale=None,
+    candidates=None,
+    iters=10,
+    verbose=True,
+):
     """Time candidate backward configs and cache the fastest.
 
     Each candidate is timed as a full step: prep, kernels and the dQ postprocess.
@@ -1162,9 +2136,32 @@ def autotune_attn_bwd(q, k, v, out, lse, pmax, dout, q_descale=None, k_descale=N
     d = q.shape[-1]
 
     def build(cfg):
-        launch, finish = make_attn_bwd(q, k, v, out, lse, pmax, dout, q_descale, k_descale, v_descale,
-                                           causal, softmax_scale, **cfg)
+        launch, finish = make_attn_bwd(
+            q,
+            k,
+            v,
+            out,
+            lse,
+            pmax,
+            dout,
+            q_descale,
+            k_descale,
+            v_descale,
+            causal,
+            softmax_scale,
+            **cfg,
+        )
         return lambda: (launch(), finish())
 
-    return autotune("bwd", d, causal, q.shape[2], k.shape[2], q.shape[1] // k.shape[1],
-                    candidates or BWD_CANDIDATES[d], build, iters, verbose)
+    return autotune(
+        "bwd",
+        d,
+        causal,
+        q.shape[2],
+        k.shape[2],
+        q.shape[1] // k.shape[1],
+        candidates or BWD_CANDIDATES[d],
+        build,
+        iters,
+        verbose,
+    )

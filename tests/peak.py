@@ -1,3 +1,5 @@
+# type: ignore
+
 import argparse
 import json
 import sys
@@ -29,7 +31,7 @@ def mma_bf16(a, b, c, *, loc=None, ip=None):
     )
     args = [Int32(x) for x in a] + [Int32(x) for x in b] + [Float32(x) for x in c]
     res = asm(
-        llvm.StructType.get_literal([T.f32()] * 4),
+        llvm.StructType.get_literal([T.f32()] * 4), # type: ignore
         args,
         code,
         "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",

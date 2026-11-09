@@ -65,12 +65,27 @@ def _panel(ax, rows, xs, x, series, colors, baseline, peaks, title):
                 continue
             value = hit[0]["metrics"][f"tf:{label}"]
             left = pos - 0.4 + width * (i + 0.5)
-            ax.bar(left, value, width, color=colors[label], label=label if pos == 0 else None)
+            ax.bar(
+                left,
+                value,
+                width,
+                color=colors[label],
+                label=label if pos == 0 else None,
+            )
             ref = hit[0]["metrics"].get(f"tf:{baseline}")
             if label != baseline and ref:
-                ax.text(left, value, f"{value / ref:.2f}x", ha="center", va="bottom", fontsize=7)
+                ax.text(
+                    left,
+                    value,
+                    f"{value / ref:.2f}x",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                )
     for label, tf in peaks.items():
-        ax.axhline(tf, color="black", linestyle=":", linewidth=1, label=f"{label} ({tf:g} TF)")
+        ax.axhline(
+            tf, color="black", linestyle=":", linewidth=1, label=f"{label} ({tf:g} TF)"
+        )
     ax.set_xticks(range(len(xs)), [_tick(v) for v in xs])
     ax.set_title(title)
     ax.set_ylabel("TFLOP/s")
@@ -107,7 +122,11 @@ def draw(data, name, path, x=None, baseline=None, peaks=None):
     xs = _unique(r["params"][x] for r in rows)
     if all(isinstance(v, (int, float)) for v in xs):
         xs.sort()
-    varying = [k for k in rows[0]["params"] if k != x and len(_unique(r["params"][k] for r in rows)) > 1]
+    varying = [
+        k
+        for k in rows[0]["params"]
+        if k != x and len(_unique(r["params"][k] for r in rows)) > 1
+    ]
     values = [_unique(r["params"][k] for r in rows) for k in varying]
     combos = list(itertools.product(*values))
     if len(varying) == 2:
@@ -119,16 +138,42 @@ def draw(data, name, path, x=None, baseline=None, peaks=None):
     for r in rows:
         lines.update(r["data"].get("peaks", {}))
     lines.update(peaks or {})
-    with plt.rc_context(STYLE):
-        fig, axes = plt.subplots(nrows, ncols, figsize=(max(3.6 * ncols, 5.0), 2.9 * nrows + 0.5), squeeze=False, sharey=True, layout="constrained")
+    with plt.rc_context(STYLE):  # type: ignore
+        fig, axes = plt.subplots(
+            nrows,
+            ncols,
+            figsize=(max(3.6 * ncols, 5.0), 2.9 * nrows + 0.5),
+            squeeze=False,
+            sharey=True,
+            layout="constrained",
+        )
         flat = [ax for line in axes for ax in line]
         for ax, combo in zip(flat, combos):
-            sel = [r for r in rows if all(_key(r["params"][k]) == _key(v) for k, v in zip(varying, combo))]
-            _panel(ax, sel, xs, x, series, colors, baseline, lines, _title(zip(varying, combo)))
-        for ax in flat[len(combos):]:
+            sel = [
+                r
+                for r in rows
+                if all(_key(r["params"][k]) == _key(v) for k, v in zip(varying, combo))
+            ]
+            _panel(
+                ax,
+                sel,
+                xs,
+                x,
+                series,
+                colors,
+                baseline,
+                lines,
+                _title(zip(varying, combo)),
+            )
+        for ax in flat[len(combos) :]:
             ax.set_visible(False)
         handles, labels = flat[0].get_legend_handles_labels()
-        fig.legend(handles, labels, loc="outside lower center", ncol=min(len(labels), 2 if ncols == 1 else 3))
+        fig.legend(
+            handles,
+            labels,
+            loc="outside lower center",
+            ncol=min(len(labels), 2 if ncols == 1 else 3),
+        )
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         fig.savefig(path)
         plt.close(fig)
@@ -138,13 +183,27 @@ def draw(data, name, path, x=None, baseline=None, peaks=None):
 def main():
     parser = argparse.ArgumentParser(prog="python -m tests.plot")
     parser.add_argument("results", help="JSON from python -m tests --bench --json")
-    parser.add_argument("--out", default="assets/figures/{name}.png",
-                        help="output file; {name} is replaced by the benchmark name")
-    parser.add_argument("--peaks", nargs="?", const="-", metavar="PATH",
-                        help="JSON with a \"peaks\" mapping from python -m tests.peak; stdin if no path is given")
-    parser.add_argument("--only", nargs="*", help="benchmark names to plot (default: all with tf: metrics)")
+    parser.add_argument(
+        "--out",
+        default="assets/figures/{name}.png",
+        help="output file; {name} is replaced by the benchmark name",
+    )
+    parser.add_argument(
+        "--peaks",
+        nargs="?",
+        const="-",
+        metavar="PATH",
+        help='JSON with a "peaks" mapping from python -m tests.peak; stdin if no path is given',
+    )
+    parser.add_argument(
+        "--only",
+        nargs="*",
+        help="benchmark names to plot (default: all with tf: metrics)",
+    )
     parser.add_argument("--x", help="parameter on the x axis (default: n, or nk)")
-    parser.add_argument("--baseline", help="series the ratios are computed against (default: the first)")
+    parser.add_argument(
+        "--baseline", help="series the ratios are computed against (default: the first)"
+    )
     args = parser.parse_args()
     with open(args.results) as f:
         data = json.load(f)
@@ -154,12 +213,20 @@ def main():
     elif args.peaks:
         with open(args.peaks) as pf:
             extra = json.load(pf)["peaks"]
-    names = args.only or _unique(r["name"] for r in data["results"] if any(k.startswith("tf:") for k in r["metrics"]))
+    names = args.only or _unique(
+        r["name"]
+        for r in data["results"]
+        if any(k.startswith("tf:") for k in r["metrics"])
+    )
     if len(names) > 1 and "{name}" not in args.out:
         parser.error("--out needs {name} when plotting more than one benchmark")
     for name in names:
         path = args.out.format(name=name)
-        print(f"wrote {path}" if draw(data, name, path, args.x, args.baseline, extra) else f"no results for {name}")
+        print(
+            f"wrote {path}"
+            if draw(data, name, path, args.x, args.baseline, extra)
+            else f"no results for {name}"
+        )
 
 
 if __name__ == "__main__":

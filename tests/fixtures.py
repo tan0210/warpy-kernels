@@ -98,7 +98,7 @@ class _Attention(torch.autograd.Function):
         return out, lse
 
     @staticmethod
-    def backward(ctx, dout, _):
+    def backward(ctx, dout, _):  # type: ignore
         q8, k8, v8, sq, sk, sv, out, lse, pmax = ctx.saved_tensors
         out, lse = (
             out.detach(),

@@ -130,7 +130,7 @@ def tune_lookup(key):
 
 def tune_store(key, cfg):
     tune_lookup(key)
-    _tune_cache[key] = cfg # type: ignore
+    _tune_cache[key] = cfg  # type: ignore
     try:
         os.makedirs(os.path.dirname(TUNE_CACHE_PATH), exist_ok=True)
         with open(TUNE_CACHE_PATH, "w") as f:

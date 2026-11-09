@@ -11,9 +11,29 @@ _TYPES = {torch.bfloat16: "bf16", torch.float16: "f16"}
 SUPPORTED = "float8_e4m3fn on compute capability 12.0 (SM120)"
 
 
-def make_gemm(a, b, out=None, bk=None, stages=3, group_m=8, min_blocks=1, bn=128, frag_pipe=False, tma=False,
-              warp_spec=False, persistent=False, setmaxnreg=False, scale_a=None, scale_b=None,
-              out_dtype=torch.bfloat16, act="", store_pre=False, pre=None, a_trans=False, b_trans=False):
+def make_gemm(
+    a,
+    b,
+    out=None,
+    bk=None,
+    stages=3,
+    group_m=8,
+    min_blocks=1,
+    bn=128,
+    frag_pipe=False,
+    tma=False,
+    warp_spec=False,
+    persistent=False,
+    setmaxnreg=False,
+    scale_a=None,
+    scale_b=None,
+    out_dtype=torch.bfloat16,
+    act="",
+    store_pre=False,
+    pre=None,
+    a_trans=False,
+    b_trans=False,
+):
     """Prepare ``out = op(a) @ op(b).T * scale_a * scale_b`` on SM120.
 
     Args:
@@ -58,7 +78,9 @@ def make_gemm(a, b, out=None, bk=None, stages=3, group_m=8, min_blocks=1, bn=128
     fp8 = a.dtype == torch.float8_e4m3fn
     if (a.dtype not in _TYPES and not fp8) or b.dtype != a.dtype:
         raise ValueError("a and b must share a bf16, fp16 or float8_e4m3fn dtype")
-    odt = out_dtype if fp8 and out is None else out.dtype if out is not None else a.dtype
+    odt = (
+        out_dtype if fp8 and out is None else out.dtype if out is not None else a.dtype
+    )
     if odt not in _TYPES:
         raise ValueError("the output must be bf16 or fp16")
     bk = bk or (128 if fp8 else 64)
@@ -71,16 +93,30 @@ def make_gemm(a, b, out=None, bk=None, stages=3, group_m=8, min_blocks=1, bn=128
     if not (a.is_contiguous() and b.is_contiguous()):
         raise ValueError("a and b must be contiguous")
     if m % GemmSm120.BM or n % bn or k % bk:
-        raise ValueError(f"M must be a multiple of 128, N of {bn} and K of {bk}, got {m}, {n}, {k}")
+        raise ValueError(
+            f"M must be a multiple of 128, N of {bn} and K of {bk}, got {m}, {n}, {k}"
+        )
     if out is None:
         out = torch.empty(m, n, dtype=odt, device=a.device)
     elif out.shape != (m, n) or not out.is_contiguous():
         raise ValueError("out must be a contiguous [M, N] tensor")
-    if act == "dgelu" and (pre is None or pre.shape != out.shape or pre.dtype != out.dtype or not pre.is_contiguous()):
+    if act == "dgelu" and (
+        pre is None
+        or pre.shape != out.shape
+        or pre.dtype != out.dtype
+        or not pre.is_contiguous()
+    ):
         raise ValueError("act='dgelu' needs a contiguous pre shaped and typed like out")
     tiles = (m // GemmSm120.BM) * (n // bn)
-    ctas = min(tiles, torch.cuda.get_device_properties(a.device).multi_processor_count * min_blocks) \
-        if persistent else tiles
+    ctas = (
+        min(
+            tiles,
+            torch.cuda.get_device_properties(a.device).multi_processor_count
+            * min_blocks,
+        )
+        if persistent
+        else tiles
+    )
     pre_out = torch.empty_like(out) if store_pre else None
     pre_in = pre if act == "dgelu" else pre_out
     ones = torch.ones(1, dtype=torch.float32, device=a.device)
@@ -88,11 +124,38 @@ def make_gemm(a, b, out=None, bk=None, stages=3, group_m=8, min_blocks=1, bn=128
     scale_b = ones if scale_b is None else scale_b
     # fp8 is passed as raw bytes
     raw = (lambda x: x.view(torch.uint8)) if fp8 else (lambda x: x)
-    dyn = lambda x: from_dlpack(raw(x), assumed_align=16).mark_layout_dynamic(leading_dim=1)
+    dyn = lambda x: from_dlpack(raw(x), assumed_align=16).mark_layout_dynamic(
+        leading_dim=1
+    )
     ops = [dyn(a), dyn(b)] if tma else [flat(raw(a)), flat(raw(b))]
-    args = ops + [flat(out), flat(pre_in if pre_in is not None else out), from_dlpack(scale_a.reshape(-1)), from_dlpack(scale_b.reshape(-1)),
-                  Int32(m), Int32(n), Int32(k), Int32(ctas)]
-    ctor = (_TYPES[odt], bk, stages, group_m, min_blocks, bn, frag_pipe, tma, warp_spec, persistent, setmaxnreg, fp8, act, store_pre, a_trans, b_trans)
+    args = ops + [
+        flat(out),
+        flat(pre_in if pre_in is not None else out),
+        from_dlpack(scale_a.reshape(-1)),
+        from_dlpack(scale_b.reshape(-1)),
+        Int32(m),
+        Int32(n),
+        Int32(k),
+        Int32(ctas),
+    ]
+    ctor = (
+        _TYPES[odt],
+        bk,
+        stages,
+        group_m,
+        min_blocks,
+        bn,
+        frag_pipe,
+        tma,
+        warp_spec,
+        persistent,
+        setmaxnreg,
+        fp8,
+        act,
+        store_pre,
+        a_trans,
+        b_trans,
+    )
     kernel = compile_cached(GemmSm120, ctor, (), *args)
 
     def launch():
@@ -101,9 +164,29 @@ def make_gemm(a, b, out=None, bk=None, stages=3, group_m=8, min_blocks=1, bn=128
     return (launch, out, pre_out) if act == "gelu" else (launch, out)
 
 
-def gemm(a, b, out=None, bk=None, stages=3, group_m=8, min_blocks=1, bn=128, frag_pipe=False, tma=False,
-         warp_spec=False, persistent=False, setmaxnreg=False, scale_a=None, scale_b=None,
-         out_dtype=torch.bfloat16, act="", store_pre=False, pre=None, a_trans=False, b_trans=False):
+def gemm(
+    a,
+    b,
+    out=None,
+    bk=None,
+    stages=3,
+    group_m=8,
+    min_blocks=1,
+    bn=128,
+    frag_pipe=False,
+    tma=False,
+    warp_spec=False,
+    persistent=False,
+    setmaxnreg=False,
+    scale_a=None,
+    scale_b=None,
+    out_dtype=torch.bfloat16,
+    act="",
+    store_pre=False,
+    pre=None,
+    a_trans=False,
+    b_trans=False,
+):
     """Compute ``(a @ b.T) * scale_a * scale_b`` on SM120.
 
     Args:
@@ -132,8 +215,29 @@ def gemm(a, b, out=None, bk=None, stages=3, group_m=8, min_blocks=1, bn=128, fra
     Returns:
         ``[M, N]`` in the output dtype, or ``(out, pre)`` if ``act`` is set.
     """
-    launch, out, *pre = make_gemm(a, b, out, bk, stages, group_m, min_blocks, bn, frag_pipe, tma, warp_spec,
-                                  persistent, setmaxnreg, scale_a, scale_b, out_dtype, act, store_pre, pre, a_trans, b_trans)
+    launch, out, *pre = make_gemm(
+        a,
+        b,
+        out,
+        bk,
+        stages,
+        group_m,
+        min_blocks,
+        bn,
+        frag_pipe,
+        tma,
+        warp_spec,
+        persistent,
+        setmaxnreg,
+        scale_a,
+        scale_b,
+        out_dtype,
+        act,
+        store_pre,
+        pre,
+        a_trans,
+        b_trans,
+    )
     launch()
     return (out, pre[0]) if act == "gelu" else out
 
@@ -156,19 +260,41 @@ def autotune_gemm(a, b, candidates=None, iters=20, verbose=True, **kwargs):
     Raises:
         RuntimeError: If no candidate runs.
     """
-    candidates = candidates or (FP8_CANDIDATES if a.dtype == torch.float8_e4m3fn else CANDIDATES)
-    return time_candidates(candidates, lambda cfg: make_gemm(a, b, **cfg, **kwargs)[0], iters, verbose, "gemm")
+    candidates = candidates or (
+        FP8_CANDIDATES if a.dtype == torch.float8_e4m3fn else CANDIDATES
+    )
+    return time_candidates(
+        candidates,
+        lambda cfg: make_gemm(a, b, **cfg, **kwargs)[0],
+        iters,
+        verbose,
+        "gemm",
+    )
 
 
 def _check(q, what):
     if q.dtype != torch.float8_e4m3fn:
-        raise NotImplementedError(f"warpy_kernels has no {what} for {q.dtype} yet; supported: {SUPPORTED}")
+        raise NotImplementedError(
+            f"warpy_kernels has no {what} for {q.dtype} yet; supported: {SUPPORTED}"
+        )
     capability = torch.cuda.get_device_capability(q.device)
     if capability != (12, 0):
-        raise NotImplementedError(f"warpy_kernels has no {what} for compute capability {capability}; supported: {SUPPORTED}")
+        raise NotImplementedError(
+            f"warpy_kernels has no {what} for compute capability {capability}; supported: {SUPPORTED}"
+        )
 
 
-def attn_fwd(q, k, v, q_descale=None, k_descale=None, v_descale=None, causal=False, softmax_scale=None, **config):
+def attn_fwd(
+    q,
+    k,
+    v,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    causal=False,
+    softmax_scale=None,
+    **config,
+):
     """Run the attention forward kernel for the dtype of ``q``.
 
     Args:
@@ -191,11 +317,26 @@ def attn_fwd(q, k, v, q_descale=None, k_descale=None, v_descale=None, causal=Fal
         NotImplementedError: If there is no kernel for the dtype or the GPU.
     """
     _check(q, "forward kernel")
-    return sm120_attn_fwd(q, k, v, q_descale, k_descale, v_descale, causal, softmax_scale, **config)
+    return sm120_attn_fwd(
+        q, k, v, q_descale, k_descale, v_descale, causal, softmax_scale, **config
+    )
 
 
-def attn_bwd(q, k, v, out, lse, pmax, dout, q_descale=None, k_descale=None, v_descale=None, causal=False,
-             softmax_scale=None, **config):
+def attn_bwd(
+    q,
+    k,
+    v,
+    out,
+    lse,
+    pmax,
+    dout,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    causal=False,
+    softmax_scale=None,
+    **config,
+):
     """Run the attention backward kernel for the outputs of ``attn_fwd``.
 
     Args:
@@ -220,5 +361,18 @@ def attn_bwd(q, k, v, out, lse, pmax, dout, q_descale=None, k_descale=None, v_de
         NotImplementedError: If there is no kernel for the dtype or the GPU.
     """
     _check(q, "backward kernel")
-    return sm120_attn_bwd(q, k, v, out, lse, pmax, dout, q_descale, k_descale, v_descale, causal, softmax_scale,
-                        **config)
+    return sm120_attn_bwd(
+        q,
+        k,
+        v,
+        out,
+        lse,
+        pmax,
+        dout,
+        q_descale,
+        k_descale,
+        v_descale,
+        causal,
+        softmax_scale,
+        **config,
+    )
