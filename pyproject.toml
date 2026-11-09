@@ -1,22 +1,29 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "warpy-kernels"
 version = "0.1.0"
 description = "CuTE Kernels for Local LLMs"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE.txt"]
+authors = [{ name = "tan0210" }]
 requires-python = ">=3.12"
 dependencies = [
     "nvidia-cutlass-dsl==4.8.1",
     "torch>=2.14.1",
 ]
 
+[project.urls]
+Repository = "https://github.com/tan0210/warpy-kernels"
+
 [tool.hatch.build.targets.wheel]
 packages = ["warpy_kernels"]
 
 [tool.hatch.build.targets.sdist]
-include = ["warpy_kernels"]
+include = ["warpy_kernels", "README.md", "LICENSE.txt"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
