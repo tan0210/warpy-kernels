@@ -5,7 +5,7 @@ will be made for SM89 and SM80.
 
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cu130
-pip install warpy-kernels
+pip install "git+https://github.com/tan0210/warpy-kernels"
 ```
 
 ```python
