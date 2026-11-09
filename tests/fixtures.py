@@ -136,7 +136,7 @@ def reference(q, k, v, causal):
     Returns:
         ``(out, lse)`` with ``lse`` in base 2.
     """
-    B, Hq, Nq, d = q.shape
+    _, Hq, Nq, d = q.shape
     Nk = k.shape[2]
     rep = Hq // k.shape[1]
     k, v = k.repeat_interleave(rep, 1), v.repeat_interleave(rep, 1)

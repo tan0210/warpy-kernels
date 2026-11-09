@@ -3,7 +3,7 @@ import torch
 from tests.fixtures import attention, compare, randn_qkv
 from tests.registry import case
 
-TOL = dict(out=6e-2, lse=5e-2, dq=8e-2, dk=8e-2, dv=8e-2)
+TOL = {"out": 6e-2, "lse": 5e-2, "dq": 8e-2, "dk": 8e-2, "dv": 8e-2}
 
 SHAPES = [
     (1, 1, 1, 128, 128, 128),
@@ -14,16 +14,16 @@ SHAPES = [
 ]
 
 BWD_CONFIGS = [
-    dict(dq_bulk=False),
-    dict(num_warps=4),
-    dict(num_stages=3),
-    dict(block_m=32, dq_bulk=True),
-    dict(block_m=32, dq_bulk=False, min_blocks=2),
-    dict(kb_major=True),
-    dict(dq_wg=True),
-    dict(dq_wg=True, dq_bulk=False),
-    dict(dq_wg=True, num_stages=3, kb_major=True),
-    dict(block_m=32, dq_bulk=False, min_blocks=2, kb_major=True),
+    {"dq_bulk": False},
+    {"num_warps": 4},
+    {"num_stages": 3},
+    {"block_m": 32, "dq_bulk": True},
+    {"block_m": 32, "dq_bulk": False, "min_blocks": 2},
+    {"kb_major": True},
+    {"dq_wg": True},
+    {"dq_wg": True, "dq_bulk": False},
+    {"dq_wg": True, "num_stages": 3, "kb_major": True},
+    {"block_m": 32, "dq_bulk": False, "min_blocks": 2, "kb_major": True},
 ]
 
 
@@ -58,9 +58,9 @@ def deterministic(ctx, shape, causal):
     grads = []
     for _ in range(2):
         qq, kk, vv = [x.detach().clone().requires_grad_() for x in (q, k, v)]
-        out, _ = attention(qq, kk, vv, causal, bwd_cfg=dict(deterministic=True))
+        out, _ = attention(qq, kk, vv, causal, bwd_cfg={"deterministic": True})
         out.backward(dout)
         grads.append((qq.grad, kk.grad, vv.grad))
     ctx.expect(all(torch.equal(a, b) for a, b in zip(*grads)), "gradients differ between identical runs")
-    _run(ctx, shape, causal, dict(deterministic=True))
+    _run(ctx, shape, causal, {"deterministic": True})
     

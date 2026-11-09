@@ -59,7 +59,7 @@ def no_lse(ctx, shape, causal):
 @case("out_arg", shape=SHAPES, causal=[False, True])
 def out_arg(ctx, shape, causal):
     q8, k8, v8, sq, sk, sv = _inputs(shape)
-    B, Hq, Hkv, Nq, Nk, d = shape
+    B, Hq, _, Nq, _, d = shape
     ref, _, _ = attn_fwd(q8, k8, v8, sq, sk, sv, causal=causal)
     buf = torch.zeros(B, Nq, Hq, d, dtype=torch.bfloat16, device="cuda")
     out, _, _ = attn_fwd(q8, k8, v8, sq, sk, sv, causal=causal, out=buf.transpose(1, 2))

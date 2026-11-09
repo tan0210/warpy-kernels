@@ -1,3 +1,5 @@
+# type: ignore
+
 import math
 
 import cutlass
@@ -77,11 +79,10 @@ class BwdPrep:
         prow = bidx * self.ROWS_PER_CTA + tidx // 32
         b, hq, i, hkv = self._row_coords(prow, nq_pad, h_q, h_kv)
         row = (b * h_q + hq) * nq + i
-        if const_expr(self.zero_dq):
-            if prow < rows_pad:
-                if i >= nq:
-                    gz = Int64(mDqAcc.iterator.toint()) + (Int64(prow) * self.d + Int64(lane * self.per_lane)) * 4
-                    st_global_zero(gz, self.per_lane)
+        if const_expr(self.zero_dq):  # noqa: SIM102  # the DSL needs the const_expr and runtime ifs kept separate
+            if prow < rows_pad and i >= nq:
+                gz = Int64(mDqAcc.iterator.toint()) + (Int64(prow) * self.d + Int64(lane * self.per_lane)) * 4
+                st_global_zero(gz, self.per_lane)
         if prow < rows_pad and i < nq:
             m = Float32(0.0)
             xin = ld_global_bf16(Int64(mdO.iterator.toint()) + (Int64(row) * self.d + Int64(lane * self.per_lane)) * 2,
@@ -229,7 +230,7 @@ class AttnBwdSm120:
                 h_q: Int32, h_kv: Int32, nq_pad: Int32, sbase: Int32, gq: Int64, gdo: Int64, gl: Int64, gd: Int64,
                 tidx: Int32):
         if it < total_it:
-            row0, qi = self._q_row0(it, n_q, q_start, b, hkv, h_q, h_kv, nq_pad)
+            row0, _ = self._q_row0(it, n_q, q_start, b, hkv, h_q, h_kv, nq_pad)
             st = it % self.stages
             self._load_rows(sbase + self.q_off + st * self.q_tile_bytes, gq + Int64(row0) * self.d, self.BM, tidx)
             self._load_rows(sbase + self.do_off + st * self.q_tile_bytes, gdo + Int64(row0) * self.d, self.BM, tidx)
@@ -261,7 +262,7 @@ class AttnBwdSm120:
             cute.arch.barrier(barrier_id=1, number_of_threads=self.NUM_THREADS)
         else:
             cute.arch.sync_threads()
-        if const_expr(self.dq_bulk and not self.skip_dq and not self.dq_wg):
+        if const_expr(self.dq_bulk and not self.skip_dq and not self.dq_wg):  # noqa: SIM102  # the DSL needs the const_expr and runtime ifs kept separate
             if tidx == 0:
                 if it > 0:
                     # previous tile's staged dQ is complete, so issue its bulk reduce
@@ -994,8 +995,8 @@ def make_attn_bwd(q, k, v, out, lse, pmax, dout, q_descale=None, k_descale=None,
     desc = torch.stack([sq, sk, sv], dim=-1).contiguous()
     from_cache = num_stages is None and dq_bulk is None and block_m is None
     if num_stages is None or dq_bulk is None or block_m is None:
-        tuned = tune_lookup(tune_key("bwd", d, causal, Nq, Nk, Hq // Hkv)) or dict(
-            num_stages=2, dq_bulk=causal or d != 128, block_m=32 if d == 128 else 64)
+        tuned = tune_lookup(tune_key("bwd", d, causal, Nq, Nk, Hq // Hkv)) or {
+            "num_stages": 2, "dq_bulk": causal or d != 128, "block_m": 32 if d == 128 else 64}
         num_stages = tuned["num_stages"] if num_stages is None else num_stages
         dq_bulk = tuned["dq_bulk"] if dq_bulk is None else dq_bulk
         block_m = tuned["block_m"] if block_m is None else block_m
@@ -1119,11 +1120,11 @@ def attn_bwd(q, k, v, out, lse, pmax, dout, q_descale=None, k_descale=None, v_de
 
 
 BWD_CANDIDATES = {
-    128: [dict(block_m=32, num_stages=st, dq_bulk=bulk) for st in (2, 3) for bulk in (False, True)]
-         + [dict(block_m=32, num_stages=st, dq_bulk=bulk, dq_wg=True) for st in (2, 3) for bulk in (False, True)],
-    64: [dict(block_m=bm, num_stages=st, dq_bulk=bulk) for bm in (32, 64) for st in (2, 3) for bulk in (False, True)]
-        + [dict(block_m=32, num_stages=2, dq_bulk=bulk, min_blocks=2) for bulk in (False, True)]
-        + [dict(block_m=bm, num_stages=st, dq_bulk=bulk, dq_wg=True) for bm in (32, 64) for st in (2, 3)
+    128: [{"block_m": 32, "num_stages": st, "dq_bulk": bulk} for st in (2, 3) for bulk in (False, True)]
+         + [{"block_m": 32, "num_stages": st, "dq_bulk": bulk, "dq_wg": True} for st in (2, 3) for bulk in (False, True)],
+    64: [{"block_m": bm, "num_stages": st, "dq_bulk": bulk} for bm in (32, 64) for st in (2, 3) for bulk in (False, True)]
+        + [{"block_m": 32, "num_stages": 2, "dq_bulk": bulk, "min_blocks": 2} for bulk in (False, True)]
+        + [{"block_m": bm, "num_stages": st, "dq_bulk": bulk, "dq_wg": True} for bm in (32, 64) for st in (2, 3)
            for bulk in (False, True)],
 }
 
@@ -1167,4 +1168,3 @@ def autotune_attn_bwd(q, k, v, out, lse, pmax, dout, q_descale=None, k_descale=N
 
     return autotune("bwd", d, causal, q.shape[2], k.shape[2], q.shape[1] // k.shape[1],
                     candidates or BWD_CANDIDATES[d], build, iters, verbose)
-    

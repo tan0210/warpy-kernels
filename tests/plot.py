@@ -149,8 +149,11 @@ def main():
     with open(args.results) as f:
         data = json.load(f)
     extra = {}
-    if args.peaks:
-        extra = json.load(sys.stdin if args.peaks == "-" else open(args.peaks))["peaks"]
+    if args.peaks == "-":
+        extra = json.load(sys.stdin)["peaks"]
+    elif args.peaks:
+        with open(args.peaks) as pf:
+            extra = json.load(pf)["peaks"]
     names = args.only or _unique(r["name"] for r in data["results"] if any(k.startswith("tf:") for k in r["metrics"]))
     if len(names) > 1 and "{name}" not in args.out:
         parser.error("--out needs {name} when plotting more than one benchmark")

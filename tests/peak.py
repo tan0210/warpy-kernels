@@ -119,7 +119,7 @@ def main():
         peaks[label] = round(measure(kind, args.iters, args.reps), 1)
         print(f"{label}: {peaks[label]} TF", file=sys.stderr)
     json.dump(
-        dict(device=torch.cuda.get_device_name(), peaks=peaks), sys.stdout, indent=1
+        {"device": torch.cuda.get_device_name(), "peaks": peaks}, sys.stdout, indent=1
     )
     print()
 

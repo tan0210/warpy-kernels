@@ -37,7 +37,7 @@ def _run(entry):
             status, detail = "FAIL", "\n".join(ctx.failures)
     except Skip as e:
         status, detail = "SKIP", str(e)
-    except Exception:
+    except Exception:  # noqa: BLE001  # any test error is reported, not raised
         status, detail = "ERROR", traceback.format_exc()
     return ctx, status, detail, time.perf_counter() - start
 
@@ -70,8 +70,8 @@ def main():
     for entry in selected:
         ctx, status, detail, secs = _run(entry)
         counts[status] += 1
-        records.append(dict(id=entry.id, name=entry.name, params=entry.params, status=status, seconds=secs,
-                            metrics={n: v for n, v, _ in ctx.metrics}, data=ctx.data))
+        records.append({"id": entry.id, "name": entry.name, "params": entry.params, "status": status, "seconds": secs,
+                            "metrics": {n: v for n, v, _ in ctx.metrics}, "data": ctx.data})
         metrics = "  ".join(_fmt(*m) for m in ctx.metrics)
         first = detail.splitlines()[-1] if status == "ERROR" else detail.splitlines()[0] if detail else ""
         print(f"{status:<5} {entry.id:<{width}}  {metrics if status in ('PASS', 'FAIL') else first}  ({secs:.1f}s)", flush=True)
@@ -84,7 +84,7 @@ def main():
     for ident, status, detail in problems:
         print(f"\n{'=' * 20} {status}: {ident} {'=' * 20}\n{detail}")
     if args.json:
-        meta = dict(device=torch.cuda.get_device_name(), torch=torch.__version__)
+        meta = {"device": torch.cuda.get_device_name(), "torch": torch.__version__}
         with open(args.json, "w") as f:
             json.dump(dict(meta, results=records), f, indent=1, default=str)
         print(f"\nwrote {args.json}")

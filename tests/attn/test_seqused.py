@@ -6,7 +6,7 @@ from tests.fixtures import quantize_qkv, randn_qkv, rel_l2
 from tests.registry import case
 from warpy_kernels import attn_fwd
 
-CFG = dict(pipelined=False, num_stages=2, block_n=64)
+CFG = {"pipelined": False, "num_stages": 2, "block_n": 64}
 SHAPES = [(2, 4, 2, 512, 1024, 128), (2, 2, 2, 300, 777, 64)]
 
 

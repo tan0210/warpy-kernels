@@ -10,7 +10,7 @@ from tests.fixtures import (
 )
 from tests.registry import case
 
-TOL = dict(out=6e-2, lse=5e-2)
+TOL = {"out": 6e-2, "lse": 5e-2}
 
 SHAPES = [
     (1, 1, 1, 128, 64, 128),
@@ -23,13 +23,13 @@ SHAPES = [
 ]
 
 FWD_CONFIGS = [
-    dict(pipelined=False, num_stages=3, block_n=64),
-    dict(pipelined=True, num_stages=3, block_n=64),
-    dict(pipelined=False, num_stages=2, block_n=128),
-    dict(pipelined=True, num_stages=3, block_n=128),
-    dict(pipelined=True, num_stages=4, block_n=64),
-    dict(tile_local=False),
-    dict(lpt=True),
+    {"pipelined": False, "num_stages": 3, "block_n": 64},
+    {"pipelined": True, "num_stages": 3, "block_n": 64},
+    {"pipelined": False, "num_stages": 2, "block_n": 128},
+    {"pipelined": True, "num_stages": 3, "block_n": 128},
+    {"pipelined": True, "num_stages": 4, "block_n": 64},
+    {"tile_local": False},
+    {"lpt": True},
 ]
 
 
@@ -79,7 +79,7 @@ def sink(ctx, gap):
     q, k, v = sink_qkv(256, 32768, 128, gap)
     ref, _ = reference(*dequantize_qkv(*quantize_qkv(q, k, v)), False)
     for tile_local in (True, False):
-        out, _ = attention(q, k, v, fwd_cfg=dict(tile_local=tile_local))
+        out, _ = attention(q, k, v, fwd_cfg={"tile_local": tile_local})
         err = rel_l2(out, ref)
         if tile_local:
             ctx.metric("out", err, 2e-2)

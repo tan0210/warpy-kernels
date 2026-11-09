@@ -1,3 +1,5 @@
+# type: ignore
+
 import math
 
 import cutlass
@@ -226,7 +228,7 @@ class AttnFwdSm120:
         row_run: cute.Tensor,
     ):
         if const_expr(self.tma):
-            if const_expr(not self.warp_spec):
+            if const_expr(not self.warp_spec):  # noqa: SIM102  # the DSL needs the const_expr and runtime ifs kept separate
                 if tidx < 32:
                     self._tma_load(j + (self.stages - 1), n_blocks)
             cute.arch.mbarrier_wait(self._full + j % self.stages, (j // self.stages) & 1)
@@ -251,7 +253,7 @@ class AttnFwdSm120:
         row_max: cute.Tensor, row_run: cute.Tensor,
     ):
         if const_expr(self.tma):
-            if const_expr(not self.warp_spec):
+            if const_expr(not self.warp_spec):  # noqa: SIM102  # the DSL needs the const_expr and runtime ifs kept separate
                 if tidx < 32:
                     self._tma_load(j + (self.stages - 1), n_blocks)
             if j + 1 < n_blocks:  # tile j+1 must be resident before its QK^T is issued
@@ -403,7 +405,7 @@ class AttnFwdSm120:
             self._load_rows(sbase, gq, self.BM, tidx, qss)
             cute.arch.cp_async_commit_group()
             if const_expr(self.tma):
-                if const_expr(not self.warp_spec):
+                if const_expr(not self.warp_spec):  # noqa: SIM102  # the DSL needs the const_expr and runtime ifs kept separate
                     if tidx < 32:
                         for s in cutlass.range_constexpr(self.stages - 1):
                             self._tma_load(Int32(s), n_blocks)
@@ -450,7 +452,7 @@ class AttnFwdSm120:
 
             if const_expr(self.pipelined):
                 s_next = cute.make_rmem_tensor(4 * self.nt, Float32)
-                if const_expr(self.tma):
+                if const_expr(self.tma):  # noqa: SIM102  # the DSL needs the const_expr and runtime ifs kept separate
                     if n_blocks > 0:
                         cute.arch.mbarrier_wait(self._full, 0)
                 self._qk(Int32(0), sbase, lane, qf, s_cur)
@@ -474,7 +476,7 @@ class AttnFwdSm120:
                 pmax = cute.math.exp2(row_run[r] - lse, fastmath=True) if valid else Float32(0.0)
                 orow = o_row0 + 8 * r
                 if q_idx0 + 8 * r < seqlen_q:
-                    if const_expr(self.return_lse):
+                    if const_expr(self.return_lse):  # noqa: SIM102  # the DSL needs the const_expr and runtime ifs kept separate
                         if t == 0:
                             if const_expr(self.lse_natural):
                                 mLSE[orow] = lse * Float32(math.log(2.0))
@@ -487,13 +489,13 @@ class AttnFwdSm120:
 
 
 FWD_CANDIDATES = {
-    128: [dict(pipelined=False, num_stages=2, block_n=128), dict(pipelined=True, num_stages=4, block_n=64),
-          dict(pipelined=False, num_stages=3, block_n=64)],
-    64: [dict(pipelined=True, num_stages=4, block_n=64), dict(pipelined=False, num_stages=3, block_n=128),
-         dict(pipelined=True, num_stages=3, block_n=128), dict(pipelined=False, num_stages=2, block_n=64)],
+    128: [{"pipelined": False, "num_stages": 2, "block_n": 128}, {"pipelined": True, "num_stages": 4, "block_n": 64},
+          {"pipelined": False, "num_stages": 3, "block_n": 64}],
+    64: [{"pipelined": True, "num_stages": 4, "block_n": 64}, {"pipelined": False, "num_stages": 3, "block_n": 128},
+         {"pipelined": True, "num_stages": 3, "block_n": 128}, {"pipelined": False, "num_stages": 2, "block_n": 64}],
 }
-FWD_DEFAULTS = {128: dict(pipelined=False, num_stages=2, block_n=128, tma=True),
-                64: dict(pipelined=True, num_stages=3, block_n=128, tma=True)}
+FWD_DEFAULTS = {128: {"pipelined": False, "num_stages": 2, "block_n": 128, "tma": True},
+                64: {"pipelined": True, "num_stages": 3, "block_n": 128, "tma": True}}
 
 
 def _kernel_view(x, n_pad):
@@ -687,4 +689,3 @@ def autotune_attn_fwd(q, k, v, q_descale=None, k_descale=None, v_descale=None, c
 
     return autotune("fwd", d, causal, q.shape[2], k.shape[2], q.shape[1] // k.shape[1], candidates, build, iters,
                     verbose)
-    

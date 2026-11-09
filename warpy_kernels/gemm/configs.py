@@ -1,22 +1,22 @@
 CANDIDATES = (
     [
-        dict(bk=bk, stages=st, group_m=gm)
+        {"bk": bk, "stages": st, "group_m": gm}
         for bk, sts in ((32, (3, 4)), (64, (2, 3)))
         for st in sts
         for gm in (4, 8, 16)
     ]
     + [
-        dict(bk=32, stages=st, group_m=gm, min_blocks=2)
+        {"bk": 32, "stages": st, "group_m": gm, "min_blocks": 2}
         for st in (2, 3)
         for gm in (8, 16)
     ]
     + [
-        dict(bn=256, bk=bk, stages=st, group_m=gm)
+        {"bn": 256, "bk": bk, "stages": st, "group_m": gm}
         for bk, st in ((32, 3), (32, 4), (64, 2))
         for gm in (4, 8, 16)
     ]
     + [
-        dict(bn=bn, bk=bk, stages=st, group_m=gm, min_blocks=mb, frag_pipe=fp, tma=tma)
+        {"bn": bn, "bk": bk, "stages": st, "group_m": gm, "min_blocks": mb, "frag_pipe": fp, "tma": tma}
         for tma, fp in ((False, True), (True, False), (True, True))
         for bn, bk, st, mb in (
             (128, 32, 2, 2),
@@ -30,17 +30,17 @@ CANDIDATES = (
         for gm in (8, 16)
     ]
     + [
-        dict(
-            bn=bn,
-            bk=bk,
-            stages=st,
-            group_m=8,
-            frag_pipe=fp,
-            tma=True,
-            warp_spec=True,
-            persistent=pers,
-            setmaxnreg=smr,
-        )
+        {
+            "bn": bn,
+            "bk": bk,
+            "stages": st,
+            "group_m": 8,
+            "frag_pipe": fp,
+            "tma": True,
+            "warp_spec": True,
+            "persistent": pers,
+            "setmaxnreg": smr,
+        }
         for pers in (False, True)
         for fp in (False, True)
         for bn, bk, st, smr in (
@@ -56,7 +56,7 @@ CANDIDATES = (
 
 
 FP8_CANDIDATES = [
-    dict(bn=bn, bk=bk, stages=st, group_m=gm, min_blocks=mb, frag_pipe=fp)
+    {"bn": bn, "bk": bk, "stages": st, "group_m": gm, "min_blocks": mb, "frag_pipe": fp}
     for bn, bk, st, mb in (
         (128, 64, 3, 2),
         (128, 64, 4, 1),
@@ -67,17 +67,17 @@ FP8_CANDIDATES = [
     for fp in (False, True)
     for gm in (8, 16)
 ] + [
-    dict(
-        bn=bn,
-        bk=bk,
-        stages=st,
-        group_m=8,
-        frag_pipe=fp,
-        tma=True,
-        warp_spec=ws,
-        persistent=ws,
-        setmaxnreg=smr,
-    )
+    {
+        "bn": bn,
+        "bk": bk,
+        "stages": st,
+        "group_m": 8,
+        "frag_pipe": fp,
+        "tma": True,
+        "warp_spec": ws,
+        "persistent": ws,
+        "setmaxnreg": smr,
+    }
     for ws in (False, True)
     for fp in (False, True)
     for bn, bk, st, smr in (

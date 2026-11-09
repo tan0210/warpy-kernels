@@ -86,7 +86,7 @@ def time_candidates(candidates, build, iters, verbose, what):
     for cfg in candidates:
         try:
             results.append((cfg, time_launch_ms(build(cfg), iters)))
-        except Exception as e:  # skip configs that do not fit or fail to compile
+        except Exception as e:  # noqa: BLE001  # skip configs that do not fit or fail to compile
             results.append((cfg, f"{type(e).__name__}: {str(e)[:120]}"))
         if verbose:
             t = results[-1][1]
@@ -130,7 +130,7 @@ def tune_lookup(key):
 
 def tune_store(key, cfg):
     tune_lookup(key)
-    _tune_cache[key] = cfg
+    _tune_cache[key] = cfg # type: ignore
     try:
         os.makedirs(os.path.dirname(TUNE_CACHE_PATH), exist_ok=True)
         with open(TUNE_CACHE_PATH, "w") as f:
