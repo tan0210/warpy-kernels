@@ -2,6 +2,7 @@
 
 import math
 
+import cuda.bindings.driver as cuda
 import cutlass
 import torch
 import torch.nn.functional as F
@@ -454,6 +455,7 @@ class AttnFwdSm120:
         osb: Int64,
         osh: Int64,
         oss: Int64,
+        stream: cuda.CUstream,
     ):
         if const_expr(self.tma):
             one_stage = cute.slice_(self._stage_layout(), (None, None, 0))
@@ -517,6 +519,7 @@ class AttnFwdSm120:
             block=[self.threads, 1, 1],
             min_blocks_per_mp=1 if self.warp_spec else 0,
             smem=self.shared_storage.size_in_bytes(),
+            stream=stream,
         )
 
     @cute.kernel

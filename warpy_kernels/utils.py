@@ -1,12 +1,22 @@
 import json
 import os
 
+import cuda.bindings.driver as cuda
 import torch
 import torch.nn.functional as F
 from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
 
 _compile_cache = {}
+
+
+def current_stream():
+    """Wrap PyTorch's current CUDA stream for a kernel launch.
+
+    Returns:
+        The stream.
+    """
+    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
 
 def compile_cached(cls, ctor_args, shape_key, *args):
@@ -19,12 +29,14 @@ def compile_cached(cls, ctor_args, shape_key, *args):
         *args: Arguments the kernel is compiled for.
 
     Returns:
-        The compiled kernel.
+        The compiled kernel. Each call launches on PyTorch's current CUDA stream at that moment, so launches
+        are ordered with PyTorch's own work and are recorded by CUDA graph capture.
     """
     key = (cls.__name__, tuple(ctor_args), tuple(shape_key))
     if key not in _compile_cache:
-        _compile_cache[key] = cute.compile(cls(*ctor_args), *args)
-    return _compile_cache[key]
+        _compile_cache[key] = cute.compile(cls(*ctor_args), *args, current_stream())
+    kernel = _compile_cache[key]
+    return lambda *call_args: kernel(*call_args, current_stream())
 
 
 def flat(x):

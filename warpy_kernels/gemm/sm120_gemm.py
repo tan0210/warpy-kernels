@@ -1,5 +1,6 @@
 # type: ignore
 
+import cuda.bindings.driver as cuda
 import cutlass
 from cutlass import Float32, Int32, Int64, cute
 from cutlass.base_dsl.ast_helpers import const_expr
@@ -385,6 +386,7 @@ class GemmSm120:
         n: Int32,
         k: Int32,
         ctas: Int32,
+        stream: cuda.CUstream,
     ):
         if const_expr(self.tma):
             if const_expr(self.a_trans):
@@ -418,6 +420,7 @@ class GemmSm120:
                 block=[self.threads, 1, 1],
                 smem=self.shared_storage.size_in_bytes(),
                 min_blocks_per_mp=self.min_blocks,
+                stream=stream,
             )
         else:
             self.kernel(
@@ -427,6 +430,7 @@ class GemmSm120:
                 block=[self.NUM_THREADS, 1, 1],
                 smem=self.shared_storage.size_in_bytes(),
                 min_blocks_per_mp=self.min_blocks,
+                stream=stream,
             )
 
     @cute.kernel

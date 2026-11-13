@@ -2,6 +2,7 @@
 
 import math
 
+import cuda.bindings.driver as cuda
 import cutlass
 import torch
 from cutlass import Float32, Int32, Int64, const_expr, cute
@@ -73,16 +74,17 @@ class BwdPrep:
         nq_pad: Int32,
         h_q: Int32,
         h_kv: Int32,
+        stream: cuda.CUstream,
     ):
         nblk = (rows + (self.ROWS_PER_CTA - 1)) // self.ROWS_PER_CTA
         rows_pad = (rows // nq) * nq_pad
         nblk_pad = (rows_pad + (self.ROWS_PER_CTA - 1)) // self.ROWS_PER_CTA
         self.k_amax(mdO, mStats, mDqAcc, rows_pad, nq, nq_pad, h_q, h_kv).launch(
-            grid=[nblk_pad, 1, 1], block=[256, 1, 1]
+            grid=[nblk_pad, 1, 1], block=[256, 1, 1], stream=stream
         )
         self.k_quant(
             mdO, mO, mPmax, mdO8, mD, mTB, mStats, mDqAcc, rows, nq, nq_pad, h_q, h_kv
-        ).launch(grid=[nblk, 1, 1], block=[256, 1, 1])
+        ).launch(grid=[nblk, 1, 1], block=[256, 1, 1], stream=stream)
 
     @cute.kernel
     def k_amax(
@@ -742,6 +744,7 @@ class AttnBwdSm120:
         h_q: Int32,
         h_kv: Int32,
         batch: Int32,
+        stream: cuda.CUstream,
     ):
         self.kernel(
             mQ,
@@ -771,6 +774,7 @@ class AttnBwdSm120:
             block=[self.threads, 1, 1],
             smem=self.shared_storage.size_in_bytes(),
             min_blocks_per_mp=self.min_blocks,
+            stream=stream,
         )
 
     @cute.kernel
@@ -1263,6 +1267,7 @@ class BwdDqPost:
         h_q: Int32,
         h_kv: Int32,
         batch: Int32,
+        stream: cuda.CUstream,
     ):
         self.kernel(
             mAcc, mTB, mStats, mDesc, mdQ, softmax_scale, seqlen_q, nq_pad, h_q, h_kv
@@ -1270,6 +1275,7 @@ class BwdDqPost:
             grid=[nq_pad // self.BM, h_q, batch],
             block=[self.NUM_THREADS, 1, 1],
             smem=self.shared_storage.size_in_bytes() if const_expr(self.staged) else 0,
+            stream=stream,
         )
 
     @cute.kernel
@@ -1553,6 +1559,7 @@ class AttnBwdDqSm120:
         h_q: Int32,
         h_kv: Int32,
         batch: Int32,
+        stream: cuda.CUstream,
     ):
         self.kernel(
             mQ,
@@ -1577,6 +1584,7 @@ class AttnBwdDqSm120:
             block=[self.NUM_THREADS, 1, 1],
             smem=self.shared_storage.size_in_bytes(),
             min_blocks_per_mp=1,
+            stream=stream,
         )
 
     @cute.kernel
