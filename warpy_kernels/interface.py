@@ -109,8 +109,8 @@ def make_gemm(
         raise ValueError("accum needs an out tensor holding the addend")
     if out is None:
         out = torch.empty(m, n, dtype=odt, device=a.device)
-    elif out.shape != (m, n) or not out.is_contiguous():
-        raise ValueError("out must be a contiguous [M, N] tensor")
+    elif out.shape != (m, n) or not out.is_contiguous() or out.data_ptr() % 16:
+        raise ValueError("out must be a contiguous [M, N] tensor aligned to 16 bytes")
     if act == "dgelu" and (
         pre is None
         or pre.shape != out.shape
@@ -120,13 +120,20 @@ def make_gemm(
         raise ValueError("act='dgelu' needs a contiguous pre shaped and typed like out")
     tiles = (m // GemmSm120.BM) * (n // bn)
     ctas = (
-        min(
-            tiles,
-            torch.cuda.get_device_properties(a.device).multi_processor_count
-            * min_blocks,
-        )
+        torch.cuda.get_device_properties(a.device).multi_processor_count * min_blocks
         if persistent
         else tiles
+    )
+    # stream-K workspace and flags, one slot per CTA
+    sk_ws = (
+        torch.empty(
+            ctas * GemmSm120.NUM_THREADS * bn // 2, dtype=torch.float32, device=a.device
+        )
+        if persistent
+        else out
+    )
+    sk_flags = (
+        torch.zeros(ctas, dtype=torch.int32, device=a.device) if persistent else out
     )
     pre_out = torch.empty_like(out) if store_pre else None
     pre_in = pre if act == "dgelu" else pre_out
@@ -144,6 +151,8 @@ def make_gemm(
         flat(pre_in if pre_in is not None else out),
         from_dlpack(scale_a.reshape(-1)),
         from_dlpack(scale_b.reshape(-1)),
+        flat(sk_ws),
+        flat(sk_flags),
         Int32(m),
         Int32(n),
         Int32(k),

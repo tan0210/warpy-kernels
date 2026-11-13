@@ -99,7 +99,7 @@ class BwdPrep:
         h_q: Int32,
         h_kv: Int32,
     ):
-        # real rows feed the `dO` amax, padded rows zero their `dQaccum` row
+        # real rows feed the dO amax; padded rows zero dQaccum
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         lane = tidx % 32
@@ -203,7 +203,7 @@ class BwdPrep:
 
 class AttnBwdSm120:
     BC = 128  # key padding granularity, 16 keys per warp
-    # `setmaxnreg` targets: 8 x 224 + 4 x 56 equals 12 x 168, the launch allocation of 384 threads
+    # 8 x 224 + 4 x 56 = 12 x 168, the register budget of 384 threads
     MMA_REGS = 224
     DQ_REGS = 56
 
@@ -231,9 +231,7 @@ class AttnBwdSm120:
         self.num_warps = num_warps
         self.BC = 16 * num_warps
         self.NUM_THREADS = 32 * num_warps
-        self.threads = self.NUM_THREADS + (
-            128 if dq_wg else 0
-        )  # the dQ warps are one extra warpgroup
+        self.threads = self.NUM_THREADS + (128 if dq_wg else 0)  # extra dQ warpgroup
         self.dq_warps = 4 if dq_wg else num_warps
         self.min_blocks = min_blocks if min_blocks > 0 else 8 // num_warps
         blocks = (block_m // 16) * (head_dim // 16)
@@ -298,9 +296,7 @@ class AttnBwdSm120:
         for i in range(max(1, total // self.NUM_THREADS)):
             idx = tidx + i * self.NUM_THREADS
             if total < self.NUM_THREADS:
-                idx = (
-                    idx & (total - 1)
-                )  # extra threads repeat an identical 16-byte copy (`total` is a power of two)
+                idx = idx & (total - 1)  # extra threads repeat a copy
             row = idx // chunks
             ch = idx % chunks
             cp_async16(
@@ -358,7 +354,7 @@ class AttnBwdSm120:
                 self.BM,
                 tidx,
             )
-            # `L` and `D` rows: `BM` floats each, in 16-byte pieces
+            # L and D rows in 16-byte pieces
             pieces = self.BM // 4
             if tidx < 2 * pieces:
                 which = tidx // pieces
@@ -418,7 +414,7 @@ class AttnBwdSm120:
         t = lane % 4
 
         cute.arch.cp_async_wait_group(self.stages - 2)
-        # wait for the stage and for every MMA warp to finish the previous iteration
+        # wait for the stage and the previous iteration
         if const_expr(self.dq_wg):
             cute.arch.barrier(barrier_id=1, number_of_threads=self.NUM_THREADS)
         else:
@@ -426,7 +422,7 @@ class AttnBwdSm120:
         if const_expr(self.dq_bulk and not self.skip_dq and not self.dq_wg):  # noqa: SIM102  # the DSL needs the const_expr and runtime ifs kept separate
             if tidx == 0:
                 if it > 0:
-                    # previous tile's staged dQ is complete, so issue its bulk reduce
+                    # reduce the previous tile's dQ
                     prow0, _ = self._q_row0(
                         it - 1, n_q, q_start, b, hkv, h_q, h_kv, nq_pad
                     )
@@ -436,7 +432,7 @@ class AttnBwdSm120:
                         self.dq_stage_bytes,
                     )
                     cute.arch.cp_async_bulk_commit_group()
-                # buffer `it % 2` is rewritten below, so wait for its last reader
+                # wait until buffer it % 2 is read
                 cute.arch.cp_async_bulk_wait_group(1, read=True)
         self._load_q(
             it + (self.stages - 1),
@@ -467,7 +463,7 @@ class AttnBwdSm120:
         hq = hkv * (h_q // h_kv) + it // n_q
         tbound = mTB[(b * h_q + hq) * (nq_pad // self.BM) + qi]
         gc = gcur[0]
-        # power-of-two dS scale from the tile bound; all-zero tiles keep the old one
+        # power-of-two dS scale; all-zero tiles keep the old one
         g_t = ds_scale(tbound) if tbound > Float32(1e-30) else gc
         kappa = g_t * kc
         dgam = g_t * Float32(2.0**-P_OFFSET)
@@ -538,11 +534,11 @@ class AttnBwdSm120:
                     s_acc[idx] = p8
                     dp_acc[idx] = p8 * (dp_acc[idx] * kappa - dq)
 
-        # dS to shared memory now; the fp32 S/dP fragments die once packed
+        # stage dS in shared memory
         dsb = sbase + self.ds_off + (it % 2) * self.ds_bytes
         if const_expr(not self.skip_dq):
             if const_expr(self.dq_wg):
-                # the dQ warps are done reading this buffer's previous tile
+                # wait until the dQ warps free this buffer
                 cute.arch.mbarrier_wait(self._ds_free + it % 2, ((it // 2) & 1) ^ 1)
             for nt in cutlass.range_constexpr(self.nt):
                 for e in cutlass.range_constexpr(2):
@@ -672,7 +668,7 @@ class AttnBwdSm120:
         g = lane // 4
         t = lane % 4
         kb = sbase + self.k_off
-        # wait for every warp's dS; placed after the dV/dK GEMMs so they overlap
+        # wait for every warp's dS, after dV and dK to overlap them
         if const_expr(not self.dq_wg):
             cute.arch.sync_threads()
 
@@ -768,7 +764,7 @@ class AttnBwdSm120:
             h_q,
             h_kv,
         ).launch(
-            # key block is the slowest axis, so long causal CTAs launch first
+            # longest causal CTAs launch first
             grid=[h_kv * batch, nk_pad // self.BC, 1]
             if self.kb_major
             else [nk_pad // self.BC, h_kv, batch],
@@ -828,7 +824,7 @@ class AttnBwdSm120:
         gl = Int64(mL.iterator.toint())
         gd = Int64(mD.iterator.toint())
 
-        # query tiles this key block sees; causal keeps key `j` for query `i` iff `j <= i + Nk - Nq`
+        # causal keeps key j for query i iff j <= i + Nk - Nq
         nq_tiles = nq_pad // self.BM
         q_start = Int32(0)
         if const_expr(self.causal):
@@ -1050,7 +1046,7 @@ class AttnBwdSm120:
                             self.dq_stage_bytes,
                         )
                         cute.arch.cp_async_bulk_commit_group()
-                    # buffer `it % 2` is rewritten below, so wait for its last reader
+                    # wait until buffer it % 2 is read
                     cute.arch.cp_async_bulk_wait_group(1, read=True)
                 cute.arch.barrier(barrier_id=2, number_of_threads=128)
             cute.arch.mbarrier_wait(self._ds_full + it % 2, (it // 2) & 1)
@@ -1298,7 +1294,7 @@ class BwdDqPost:
         tile, hq, b = cute.arch.block_idx()
         hkv = hq // (h_q // h_kv)
         _, _, _, _, s_dq0 = bwd_scales(mStats, mDesc, b, hkv, softmax_scale)
-        # dS scale this tile was accumulated at, derived from the same bound
+        # dS scale of this tile, from the same bound
         s_dq = s_dq0 * div_rn(
             Float32(1.0), ds_scale(mTB[(b * h_q + hq) * (nq_pad // self.BM) + tile])
         )
@@ -1662,7 +1658,7 @@ class AttnBwdDqSm120:
         lrow = q_row0 + warp * 16 + g
         l0 = mL[lrow]
         l1 = mL[lrow + 8]
-        # the warp's 16 query rows share one prep tile, so the dS scale is fixed over the key loop
+        # one prep tile per warp, so the dS scale is fixed
         tq = m_block * self.BM + warp * 16
         gq_s = ds_scale(
             mTB[(b * h_q + hq) * (nq_pad // self.tb_block_m) + tq // self.tb_block_m]
@@ -1821,7 +1817,11 @@ def make_attn_bwd(
         raise ValueError(
             f"lse and pmax must be [B, Hq, Nq] = [{B}, {Hq}, {Nq}], got {tuple(lse.shape)} and {tuple(pmax.shape)}"
         )
-    for x, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
+    for x, name in (
+        (q_descale, "q_descale"),
+        (k_descale, "k_descale"),
+        (v_descale, "v_descale"),
+    ):
         check_descale(x, B, Hkv, name)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(d)
@@ -1875,7 +1875,7 @@ def make_attn_bwd(
         B, Hq, nq_pad, d, dtype=torch.uint8, device=dev
     )
     dvec = torch.zeros(B, Hq, nq_pad, dtype=torch.float32, device=dev)
-    # per (batch, kv head) stats `[dO amax, unused, max |V|, unused]`, then per-query-tile dS bounds
+    # [dO amax, unused, max |V|, unused] per (batch, kv head), then dS bounds per query tile
     n_stats = B * Hkv * 4
     stats_buf = torch.zeros(
         n_stats + B * Hq * (nq_pad // block_m), dtype=torch.float32, device=dev
@@ -2007,7 +2007,7 @@ def make_attn_bwd(
     )
 
     def launch():
-        # prep zeroes all `dQaccum` rows; padded rows of a partial tile hold pieces of valid rows
+        # prep zeroes every dQaccum row, including padding
         stats_buf.copy_(stats_init)
         prep(*prep_args)
         main(*main_args)

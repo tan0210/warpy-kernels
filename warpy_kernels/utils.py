@@ -75,9 +75,7 @@ def round_up(x, m):
 
 
 def pad_rows(x, n_pad, value=0):
-    n = (
-        x.shape[-2] if x.dim() == 4 else x.shape[-1]
-    )  # row axis is dim -2 if 4-D, else dim -1
+    n = x.shape[-2] if x.dim() == 4 else x.shape[-1]  # row count
     if n == n_pad:
         return x.contiguous()
     pad = (0, 0, 0, n_pad - n) if x.dim() == 4 else (0, n_pad - n)

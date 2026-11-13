@@ -16,7 +16,15 @@ CANDIDATES = (
         for gm in (4, 8, 16)
     ]
     + [
-        {"bn": bn, "bk": bk, "stages": st, "group_m": gm, "min_blocks": mb, "frag_pipe": fp, "tma": tma}
+        {
+            "bn": bn,
+            "bk": bk,
+            "stages": st,
+            "group_m": gm,
+            "min_blocks": mb,
+            "frag_pipe": fp,
+            "tma": tma,
+        }
         for tma, fp in ((False, True), (True, False), (True, True))
         for bn, bk, st, mb in (
             (128, 32, 2, 2),

@@ -1,7 +1,7 @@
 import argparse
 import importlib
 import json
-import pkgutil
+import pathlib
 import re
 import sys
 import time
@@ -51,9 +51,9 @@ def main():
     parser.add_argument("--json", metavar="PATH", help="also write the results as JSON")
     args = parser.parse_args()
 
-    for mod in pkgutil.iter_modules(tests.__path__):
-        if mod.name.startswith("test_"):
-            importlib.import_module(f"tests.{mod.name}")
+    for root in map(pathlib.Path, tests.__path__):
+        for path in sorted(root.rglob("test_*.py")):  # includes subfolders
+            importlib.import_module(".".join(("tests", *path.relative_to(root).with_suffix("").parts)))
     match = _matcher(args.k)
     selected = [e for e in (BENCHES if args.bench else CASES) if match(e.id)]
     if args.list:

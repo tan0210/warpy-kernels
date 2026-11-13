@@ -11,7 +11,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from warpy_kernels.sm120.ptx import asm, mma_fp8, unpack_struct
+from warpy_kernels.sm120.ptx import asm, mma_fp8, mma_mxf8, unpack_struct
 
 THREADS = 256
 CHAINS = 8
@@ -19,6 +19,7 @@ CHAINS = 8
 # kind: (label, FLOP per mma.sync per thread)
 KINDS = {
     "fp8": ("FP8 MMA peak", 16 * 8 * 32 * 2 // 32),
+    "mxf8": ("FP8 block-scaled MMA peak", 16 * 8 * 32 * 2 // 32),
     "bf16": ("BF16 MMA peak", 16 * 8 * 16 * 2 // 32),
 }
 
@@ -52,6 +53,8 @@ class MmaRate:
             frag = [acc[4 * c], acc[4 * c + 1], acc[4 * c + 2], acc[4 * c + 3]]
             if cutlass.const_expr(self.kind == "fp8"):
                 r = mma_fp8([a0, a0, a0, a0], [b0, b0], frag)
+            elif cutlass.const_expr(self.kind == "mxf8"):
+                r = mma_mxf8([a0, a0, a0, a0], [b0, b0], frag)
             else:
                 r = mma_bf16([a0, a0, a0, a0], [b0, b0], frag)
             for x in cutlass.range_constexpr(4):

@@ -100,6 +100,31 @@ def mma_fp8(a, b, c, ta="e4m3", tb="e4m3", *, loc=None, ip=None):
 
 
 @dsl_user_op
+def mma_mxf8(a, b, c, *, loc=None, ip=None):
+    # `mma_fp8` with unit scales, twice as fast on SM120
+    code = (
+        "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+        "{$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12, $13}, $14, {0, 0}, $14, {0, 0};"
+    )
+    args = (
+        [Int32(x) for x in a]
+        + [Int32(x) for x in b]
+        + [Float32(x) for x in c]
+        + [Int32(0x7F7F7F7F)]  # ue8m0 1.0 in every byte
+    )
+    res = asm(
+        llvm.StructType.get_literal([T.f32()] * 4),
+        args,
+        code,
+        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f,r",
+        False,
+        loc,
+        ip,
+    )
+    return unpack_struct(res, T.f32(), Float32, 4, loc, ip)
+
+
+@dsl_user_op
 def pack_half2(lo, hi, ty, *, loc=None, ip=None):
     return Int32(
         asm(
@@ -290,6 +315,75 @@ def st_global_b32(gaddr, val, *, loc=None, ip=None):
         loc,
         ip,
     )
+
+
+@dsl_user_op
+def st_global_v4_b32(gaddr, w0, w1, w2, w3, *, loc=None, ip=None):
+    asm(
+        None,
+        [Int64(gaddr), Int32(w0), Int32(w1), Int32(w2), Int32(w3)],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r,~{memory}",
+        True,
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
+def st_global_v4_f32(gaddr, x0, x1, x2, x3, *, loc=None, ip=None):
+    asm(
+        None,
+        [Int64(gaddr), Float32(x0), Float32(x1), Float32(x2), Float32(x3)],
+        "st.global.v4.f32 [$0], {$1, $2, $3, $4};",
+        "l,f,f,f,f,~{memory}",
+        True,
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
+def ld_global_cg_v4_f32(gaddr, *, loc=None, ip=None):
+    res = asm(  # bypasses L1
+        llvm.StructType.get_literal([T.f32()] * 4),
+        [Int64(gaddr)],
+        "ld.global.cg.v4.f32 {$0, $1, $2, $3}, [$4];",
+        "=f,=f,=f,=f,l,~{memory}",
+        True,
+        loc,
+        ip,
+    )
+    return unpack_struct(res, T.f32(), Float32, 4, loc, ip)
+
+
+@dsl_user_op
+def fence_gpu(*, loc=None, ip=None):
+    asm(None, [], "fence.acq_rel.gpu;", "~{memory}", True, loc, ip)
+
+
+@dsl_user_op
+def st_release_gpu_b32(gaddr, val, *, loc=None, ip=None):
+    asm(
+        None,
+        [Int64(gaddr), Int32(val)],
+        "st.release.gpu.global.b32 [$0], $1;",
+        "l,r,~{memory}",
+        True,
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
+def wait_flag_acquire(gaddr, *, loc=None, ip=None):
+    # spin until the flag is set, then reset it
+    code = (
+        "{\n\t.reg .pred p;\n\t.reg .b32 v;\n\t"
+        "SPIN${:uid}:\n\tld.acquire.gpu.global.b32 v, [$0];\n\tsetp.eq.b32 p, v, 0;\n\t@p bra SPIN${:uid};\n\t"
+        "st.relaxed.gpu.global.b32 [$0], 0;\n\t}"
+    )
+    asm(None, [Int64(gaddr)], code, "l,~{memory}", True, loc, ip)
 
 
 @dsl_user_op

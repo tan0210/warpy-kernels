@@ -151,9 +151,7 @@ class AttnFwdSm120:
 
     @cute.jit
     def _stage_layout(self):
-        sw = cute.make_swizzle(
-            self.sw_bits, 4, 3
-        )  # 128B swizzle for `d=128`, 64B for `d=64`
+        sw = cute.make_swizzle(self.sw_bits, 4, 3)  # 128B for d=128, 64B for d=64
         return cute.make_composed_layout(
             sw,
             0,
@@ -172,7 +170,7 @@ class AttnFwdSm120:
                 cute.arch.mbarrier_arrive_and_expect_tx(
                     self._full + s, 2 * self.kv_tile_bytes
                 )
-            warp_sync()  # the TMA copy runs `elect.sync` on the full warp, so reconverge first
+            warp_sync()  # TMA copies need the full warp
             cute.copy(
                 self._atom_k,
                 self._tKgK[(None, self._tile0 + jn)],
@@ -190,9 +188,7 @@ class AttnFwdSm120:
     def _tma_release(self, jt: Int32, lane: Int32):
         warp_sync()
         if lane == 0:
-            cute.arch.mbarrier_arrive(
-                self._empty + jt % self.stages
-            )  # this warp is done reading the stage
+            cute.arch.mbarrier_arrive(self._empty + jt % self.stages)  # stage is free
 
     @cute.jit
     def _qk(
@@ -263,11 +259,10 @@ class AttnFwdSm120:
             m_ref = row_max[r]  # reference for `O` and `l`
             m_run = cute.arch.fmax(row_run[r], m_tile)  # true running max
             row_run[r] = m_run
-            # reference is the tile's own max, so P keeps its tail
+            # the tile max keeps small P values representable
             if const_expr(self.tile_local):
-                m_new = cute.arch.fmax(
-                    m_tile, m_run - Float32(60.0)
-                )  # at least `m_run - 60`
+                # at least m_run - 60
+                m_new = cute.arch.fmax(m_tile, m_run - Float32(60.0))
                 m_new = m_ref if m_tile == neg_inf else m_new
             else:
                 m_new = m_run
@@ -409,18 +404,16 @@ class AttnFwdSm120:
             if const_expr(not self.warp_spec):  # noqa: SIM102  # the DSL needs the const_expr and runtime ifs kept separate
                 if tidx < 32:
                     self._tma_load(j + (self.stages - 1), n_blocks)
-            if j + 1 < n_blocks:  # tile j+1 must be resident before its QK^T is issued
+            if j + 1 < n_blocks:  # tile j+1 must be loaded
                 cute.arch.mbarrier_wait(
                     self._full + (j + 1) % self.stages, ((j + 1) // self.stages) & 1
                 )
         else:
-            cute.arch.cp_async_wait_group(
-                self.stages - 3
-            )  # tile j+1 must be resident before its QK^T is issued
+            cute.arch.cp_async_wait_group(self.stages - 3)  # tile j+1 must be loaded
             cute.arch.sync_threads()
             self._load_tile(j + (self.stages - 1), n_blocks, sbase, gk, gv, tidx)
             cute.arch.cp_async_commit_group()
-        # overlaps tile `j`'s softmax; the last tile reads a stale, unused stage
+        # overlaps tile j's softmax; the last read is unused
         self._qk(j + 1, sbase, lane, qf, s_next)
         self._softmax(beta, s_cur, o_acc, l_acc, row_max, row_run)
         self._pv(j, sbase, v_key, s_cur, o_acc, l_acc)
@@ -467,7 +460,7 @@ class AttnFwdSm120:
     ):
         if const_expr(self.tma):
             one_stage = cute.slice_(self._stage_layout(), (None, None, 0))
-            # `[B, H, N, d]` becomes `(N, d, H, B)`, so the tile slices out `(BN, d)` for one head
+            # view [B, H, N, d] as (N, d, H, B)
             mK_t = cute.make_tensor(
                 mK.iterator, cute.select(mK.layout, mode=[2, 3, 1, 0])
             )
@@ -520,7 +513,7 @@ class AttnFwdSm120:
             atom_v,
             tv,
         ).launch(
-            # query block is the slowest axis, descending, so long causal CTAs launch first
+            # longest causal CTAs launch first
             grid=[h_q * batch, nq_pad // self.BM, 1]
             if self.lpt
             else [nq_pad // self.BM, h_q, batch],
@@ -658,9 +651,7 @@ class AttnFwdSm120:
             nb = nb if nb > 0 else Int32(0)
             n_blocks = min(n_blocks, nb)
 
-        if (
-            warp >= self.NUM_THREADS // 32
-        ):  # producer warp group, only its first warp issues loads
+        if warp >= self.NUM_THREADS // 32:  # producer warp group
             if const_expr(self.warp_spec):
                 cute.arch.setmaxregister_decrease(self.PRODUCER_REGS)
                 if warp == self.NUM_THREADS // 32:
@@ -684,9 +675,8 @@ class AttnFwdSm120:
                     cute.arch.cp_async_commit_group()
                 # Q and tile 0 resident
                 cute.arch.cp_async_wait_group(self.stages - 2)
-            cute.arch.barrier(
-                barrier_id=1, number_of_threads=self.NUM_THREADS
-            )  # consumers only
+            # consumers only
+            cute.arch.barrier(barrier_id=1, number_of_threads=self.NUM_THREADS)
             qf = cute.make_rmem_tensor(4 * kq_steps, Int32)
             for kq in cutlass.range_constexpr(kq_steps):
                 qrow = (lane % 8) + ((lane // 8) % 2) * 8 + warp * 16
@@ -774,7 +764,7 @@ class AttnFwdSm120:
                         row_run,
                     )
 
-            # normalize, then write `O` (bf16), base-2 LSE, row max probability
+            # normalize and write O, the base-2 LSE and the max probability
             go = Int64(mO.iterator.toint()) + (Int64(b) * osb + Int64(hq) * osh) * 2
             o_row0 = q_row0 + warp * 16 + g
             for r in cutlass.range_constexpr(2):
@@ -929,7 +919,11 @@ def make_attn_fwd(
             "need q [B, Hq, Nq, d] and k, v [B, Hkv, Nk, d] with d 64 or 128 and Hq a multiple of Hkv, "
             f"got {tuple(q.shape)}, {tuple(k.shape)}, {tuple(v.shape)}"
         )
-    for x, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
+    for x, name in (
+        (q_descale, "q_descale"),
+        (k_descale, "k_descale"),
+        (v_descale, "v_descale"),
+    ):
         check_descale(x, B, Hkv, name)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(d)

@@ -33,6 +33,9 @@ name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
+[tool.basedpyright]
+typeCheckingMode = "standard"
+
 [dependency-groups]
 dev = [
     "matplotlib>=3.11.2",
