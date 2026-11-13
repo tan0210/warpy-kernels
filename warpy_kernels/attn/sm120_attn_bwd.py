@@ -19,7 +19,7 @@ from ..sm120.ptx import (
     ld_shared_v2_f32,
     ldsm_x2_trans_b8,
     ldsm_x4,
-    mma_fp8,
+    mma_mxf8,
     pack_e4m3x4,
     pack_half2,
     red_add_v2_f32,
@@ -483,7 +483,7 @@ class AttnBwdSm120:
                 b_o = ldsm_x4(ob + self._swz_off(brow, bch))
                 for h in cutlass.range_constexpr(2):
                     nt = 2 * npair + h
-                    c = mma_fp8(
+                    c = mma_mxf8(
                         a_k,
                         [b_q[2 * h], b_q[2 * h + 1]],
                         [
@@ -495,7 +495,7 @@ class AttnBwdSm120:
                     )
                     for x in cutlass.range_constexpr(4):
                         s_acc[4 * nt + x] = c[x]
-                    c = mma_fp8(
+                    c = mma_mxf8(
                         a_v,
                         [b_o[2 * h], b_o[2 * h + 1]],
                         [
@@ -624,7 +624,7 @@ class AttnBwdSm120:
                 bq = ldsm_x2_trans_b8(qb + self._swz_off(qrow, npair))
                 for h in cutlass.range_constexpr(2):
                     nt = 2 * npair + h
-                    c = mma_fp8(
+                    c = mma_mxf8(
                         pa,
                         [bo[h], bo[2 + h]],
                         [
@@ -636,7 +636,7 @@ class AttnBwdSm120:
                     )
                     for x in cutlass.range_constexpr(4):
                         dv_acc[4 * nt + x] = c[x]
-                    c = mma_fp8(
+                    c = mma_mxf8(
                         da,
                         [bq[h], bq[2 + h]],
                         [
@@ -685,7 +685,7 @@ class AttnBwdSm120:
                 a = ldsm_x4(dsb + self._ds_off(arow, lane // 16 + 2 * ks))
                 bk = ldsm_x2_trans_b8(kb + self._swz_off(lane + 32 * ks, ch))
                 for h in cutlass.range_constexpr(2):
-                    c = mma_fp8(
+                    c = mma_mxf8(
                         a,
                         [bk[h], bk[2 + h]],
                         [
@@ -1448,7 +1448,7 @@ class AttnBwdDqSm120:
                 bv = ldsm_x4(vbase + self._swz_off(key, ch))
                 for h in cutlass.range_constexpr(2):
                     nt = 2 * npair + h
-                    c = mma_fp8(
+                    c = mma_mxf8(
                         [qf[4 * kk], qf[4 * kk + 1], qf[4 * kk + 2], qf[4 * kk + 3]],
                         [bk[2 * h], bk[2 * h + 1]],
                         [
@@ -1460,7 +1460,7 @@ class AttnBwdDqSm120:
                     )
                     for x in cutlass.range_constexpr(4):
                         s_acc[4 * nt + x] = c[x]
-                    c = mma_fp8(
+                    c = mma_mxf8(
                         [of[4 * kk], of[4 * kk + 1], of[4 * kk + 2], of[4 * kk + 3]],
                         [bv[2 * h], bv[2 * h + 1]],
                         [
@@ -1522,7 +1522,7 @@ class AttnBwdDqSm120:
                 bk = ldsm_x2_trans_b8(kbase + self._swz_off(key, npair))
                 for h in cutlass.range_constexpr(2):
                     nt = 2 * npair + h
-                    c = mma_fp8(
+                    c = mma_mxf8(
                         da,
                         [bk[h], bk[2 + h]],
                         [

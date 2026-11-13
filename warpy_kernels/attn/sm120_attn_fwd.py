@@ -15,7 +15,7 @@ from ..sm120.ptx import (
     cp_async16,
     ldsm_x2_trans_b8,
     ldsm_x4,
-    mma_fp8,
+    mma_mxf8,
     pack_e4m3x4,
     pack_half2,
     st_global_b32,
@@ -203,7 +203,7 @@ class AttnFwdSm120:
                 bfr = ldsm_x4(kbase + self._swz_off(key, ch))
                 for h in cutlass.range_constexpr(2):
                     nt = 2 * npair + h
-                    c = mma_fp8(
+                    c = mma_mxf8(
                         [qf[4 * kk], qf[4 * kk + 1], qf[4 * kk + 2], qf[4 * kk + 3]],
                         [bfr[2 * h], bfr[2 * h + 1]],
                         [
@@ -312,7 +312,7 @@ class AttnFwdSm120:
                     acc[4 * t0 + 15],
                 ),
             ]
-            c = mma_fp8(pa, [ones, ones], [l_acc[0], l_acc[1], l_acc[2], l_acc[3]])
+            c = mma_mxf8(pa, [ones, ones], [l_acc[0], l_acc[1], l_acc[2], l_acc[3]])
             for x in cutlass.range_constexpr(4):
                 l_acc[x] = c[x]
             key = v_key + 32 * kk2
@@ -321,7 +321,7 @@ class AttnFwdSm120:
                 vb = ldsm_x2_trans_b8(vbase + self._swz_off(key, npair))
                 for h in cutlass.range_constexpr(2):
                     nt = 2 * npair + h
-                    c = mma_fp8(
+                    c = mma_mxf8(
                         pa,
                         [vb[h], vb[2 + h]],
                         [
