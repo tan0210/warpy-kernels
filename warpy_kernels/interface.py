@@ -33,6 +33,7 @@ def make_gemm(
     pre=None,
     a_trans=False,
     b_trans=False,
+    accum=False,
 ):
     """Prepare ``out = op(a) @ op(b).T * scale_a * scale_b`` on SM120.
 
@@ -66,6 +67,9 @@ def make_gemm(
             ``act="dgelu"``, ignored otherwise.
         a_trans: Whether ``a`` is stored ``[K, M]``. Needs bf16 or fp16 inputs.
         b_trans: Whether ``b`` is stored ``[K, N]``. Same limits as ``a_trans``.
+        accum: Whether to add the scaled product to the values ``out`` already holds. The sum is formed before
+            the activation, so ``act="gelu"`` gives ``gelu(product + out)`` and ``act="dgelu"`` gives
+            ``(product + out) * gelu'(pre)``. Needs ``out``.
 
     Returns:
         ``(launch, out)``, or ``(launch, out, pre)`` if ``act="gelu"``, where ``pre`` is ``None`` unless
@@ -96,6 +100,8 @@ def make_gemm(
         raise ValueError(
             f"M must be a multiple of 128, N of {bn} and K of {bk}, got {m}, {n}, {k}"
         )
+    if accum and out is None:
+        raise ValueError("accum needs an out tensor holding the addend")
     if out is None:
         out = torch.empty(m, n, dtype=odt, device=a.device)
     elif out.shape != (m, n) or not out.is_contiguous():
@@ -155,6 +161,7 @@ def make_gemm(
         store_pre,
         a_trans,
         b_trans,
+        accum,
     )
     kernel = compile_cached(GemmSm120, ctor, (), *args)
 
@@ -186,6 +193,7 @@ def gemm(
     pre=None,
     a_trans=False,
     b_trans=False,
+    accum=False,
 ):
     """Compute ``(a @ b.T) * scale_a * scale_b`` on SM120.
 
@@ -211,6 +219,7 @@ def gemm(
         pre: As in ``make_gemm``.
         a_trans: As in ``make_gemm``.
         b_trans: As in ``make_gemm``.
+        accum: As in ``make_gemm``.
 
     Returns:
         ``[M, N]`` in the output dtype, or ``(out, pre)`` if ``act`` is set.
@@ -237,6 +246,7 @@ def gemm(
         pre,
         a_trans,
         b_trans,
+        accum,
     )
     launch()
     return (out, pre[0]) if act == "gelu" else out

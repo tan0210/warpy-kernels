@@ -44,7 +44,9 @@ class GemmSm120:
         store_pre: bool = False,
         a_trans: bool = False,
         b_trans: bool = False,
+        accum: bool = False,
     ):
+        self.accum = accum
         assert not ((a_trans or b_trans) and fp8), (
             "transposed operands need 16-bit inputs"
         )
@@ -654,6 +656,11 @@ class GemmSm120:
                     off = (Int64(row) * Int64(n) + Int64(col)) * 2
                     v0 = acc[o] * alpha
                     v1 = acc[o + 1] * alpha
+                    if const_expr(self.accum):
+                        # the output buffer holds an addend, which joins before the activation
+                        c0, c1 = unpack_half2(ld_global_b32(gc + off), self.ty)
+                        v0 = v0 + c0
+                        v1 = v1 + c1
                     if const_expr(self.act == "gelu"):
                         if const_expr(self.store_pre):
                             st_global_b32(gp + off, pack_half2(v0, v1, self.ty))
