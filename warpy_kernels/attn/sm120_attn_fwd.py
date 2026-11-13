@@ -22,7 +22,15 @@ from ..sm120.ptx import (
     swizzle_offset,
     warp_sync,
 )
-from ..utils import autotune, compile_cached, flat, round_up, tune_key, tune_lookup
+from ..utils import (
+    autotune,
+    check_descale,
+    compile_cached,
+    flat,
+    round_up,
+    tune_key,
+    tune_lookup,
+)
 from .constants import E4M3_ONE_X4, LOG2E, P_OFFSET
 
 
@@ -580,7 +588,7 @@ class AttnFwdSm120:
         beta = softmax_scale * mDq[b, hkv] * mDk[b, hkv] * LOG2E
         sv = mDv[b, hkv]
 
-        storage = cutlass.utils.SmemAllocator().allocate(self.shared_storage)
+        storage = cutlass.memory.SmemAllocator().allocate(self.shared_storage)
         if const_expr(self.tma):
             # Q, K, V stages are consecutive, matching the `cp.async` offsets
             sbase = Int32(
@@ -861,6 +869,8 @@ def make_attn_fwd(
 ):
     """Prepare an attention forward launch on SM120.
 
+    ``launch()`` may not see later in-place changes to the inputs. Call ``make_attn_fwd`` again for new values.
+
     Args:
         q: ``[B, Hq, Nq, d]`` ``torch.float8_e4m3fn``. ``d`` is 64 or 128. Any strides work if the last one is 1,
             such as a transposed ``[B, N, H, d]`` tensor. Inputs are copied if a stride or the base address is
@@ -900,13 +910,27 @@ def make_attn_fwd(
         ``lse`` and ``pmax`` are ``None`` if ``return_lse`` is false.
 
     Raises:
-        ValueError: If ``out`` has the wrong shape, dtype or strides, or ``seqused_k`` is not an int32 CUDA tensor
-            of shape ``[B]``.
+        ValueError: If ``q``, ``k`` or ``v`` has the wrong dtype or shape, a descale is not ``[B, Hkv]``, ``out``
+            has the wrong shape, dtype or strides, or ``seqused_k`` is not an int32 CUDA tensor of shape ``[B]``.
     """
     B, Hq, Nq, d = q.shape
     Hkv, Nk = k.shape[1], k.shape[2]
-    assert q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
-    assert d in (64, 128) and Hq % Hkv == 0
+    if not (q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn):
+        raise ValueError("q, k and v must be torch.float8_e4m3fn")
+    if (
+        k.dim() != 4
+        or v.shape != k.shape
+        or k.shape[0] != B
+        or k.shape[3] != d
+        or d not in (64, 128)
+        or Hq % Hkv
+    ):
+        raise ValueError(
+            "need q [B, Hq, Nq, d] and k, v [B, Hkv, Nk, d] with d 64 or 128 and Hq a multiple of Hkv, "
+            f"got {tuple(q.shape)}, {tuple(k.shape)}, {tuple(v.shape)}"
+        )
+    for x, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
+        check_descale(x, B, Hkv, name)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(d)
     if (

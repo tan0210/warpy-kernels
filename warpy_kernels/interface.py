@@ -87,6 +87,11 @@ def make_gemm(
     )
     if odt not in _TYPES:
         raise ValueError("the output must be bf16 or fp16")
+    # 16-bit kernels take the MMA input type from the output type, so the two must agree
+    if not fp8 and odt != a.dtype:
+        raise ValueError(
+            f"out must have the dtype of a and b for 16-bit inputs, got {odt} and {a.dtype}"
+        )
     bk = bk or (128 if fp8 else 64)
     if (a_trans or b_trans) and fp8:
         raise ValueError("transposed operands need bf16 or fp16 inputs")

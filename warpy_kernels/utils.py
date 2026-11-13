@@ -51,6 +51,25 @@ def flat(x):
     return from_dlpack(x.reshape(-1), assumed_align=16)
 
 
+def check_descale(x, batch, h_kv, name):
+    """Check that a dequantization scale is ``None`` or a ``[B, Hkv]`` tensor on a CUDA device.
+
+    Args:
+        x: The scale, or ``None``.
+        batch: Batch size ``B``.
+        h_kv: Number of KV heads ``Hkv``.
+        name: Argument name for the error message.
+
+    Raises:
+        ValueError: If ``x`` is not ``None`` and is not shaped ``[B, Hkv]`` on a CUDA device.
+    """
+    if x is not None and (tuple(x.shape) != (batch, h_kv) or not x.is_cuda):
+        raise ValueError(
+            f"{name} must be a CUDA tensor of shape [B, Hkv] = [{batch}, {h_kv}], "
+            f"got {tuple(x.shape)} on {x.device}"
+        )
+
+
 def round_up(x, m):
     return (x + m - 1) // m * m
 

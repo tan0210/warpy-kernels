@@ -33,6 +33,7 @@ from ..sm120.ptx import (
 )
 from ..utils import (
     autotune,
+    check_descale,
     compile_cached,
     flat,
     pad_rows,
@@ -813,7 +814,7 @@ class AttnBwdSm120:
 
         beta, kc, s_dk0, s_dv, _ = bwd_scales(mStats, mDesc, b, hkv, softmax_scale)
 
-        storage = cutlass.utils.SmemAllocator().allocate(self.shared_storage)
+        storage = cutlass.memory.SmemAllocator().allocate(self.shared_storage)
         sbase = Int32(
             storage.buf.get_tensor(cute.make_layout(self.smem_bytes)).iterator.toint()
         )
@@ -1306,7 +1307,7 @@ class BwdDqPost:
         dchunks = d // 16
         if const_expr(self.staged):
             # coalesced copy into shared memory, then coalesced row-major writes
-            storage = cutlass.utils.SmemAllocator().allocate(self.shared_storage)
+            storage = cutlass.memory.SmemAllocator().allocate(self.shared_storage)
             sacc = storage.buf.get_tensor(cute.make_layout(self.tile_floats))
             for k in cutlass.range_constexpr(self.tile_floats // self.NUM_THREADS):
                 idx = tidx + self.NUM_THREADS * k
@@ -1619,7 +1620,7 @@ class AttnBwdDqSm120:
         hkv = hq // (h_q // h_kv)
         beta, kc, _, _, s_dq0 = bwd_scales(mStats, mDesc, b, hkv, softmax_scale)
 
-        storage = cutlass.utils.SmemAllocator().allocate(self.shared_storage)
+        storage = cutlass.memory.SmemAllocator().allocate(self.shared_storage)
         sbase = Int32(
             storage.buf.get_tensor(cute.make_layout(self.smem_bytes)).iterator.toint()
         )
@@ -1749,8 +1750,11 @@ def make_attn_bwd(
     min_blocks=None,
     kb_major=None,
     dq_wg=None,
+    seqused_k=None,
 ):
     """Prepare the attention backward on SM120.
+
+    ``launch()`` may not see later in-place changes to the inputs. Call ``make_attn_bwd`` again for new values.
 
     Args:
         q: The forward's E4M3 ``q``, ``[B, Hq, Nq, d]``.
@@ -1778,13 +1782,47 @@ def make_attn_bwd(
             one CTA per SM, so ``min_blocks`` is forced to 1. Defaults to the tuned value, else ``False``.
         kb_major: Whether to launch key blocks slowest, so the longest causal CTAs go first. Defaults to
             ``True`` for causal attention and ``False`` otherwise.
+        seqused_k: Must be ``None``. The backward attends to all ``Nk`` keys, so it cannot follow a forward that
+            was given ``seqused_k``; passing one raises instead of returning wrong gradients.
 
     Returns:
         ``(launch, finish)``. ``launch()`` quantizes ``dout`` and runs the backward kernels. ``finish()`` then
         returns ``(dq, dk, dv)`` in bf16: gradients with respect to the dequantized ``q``, ``k`` and ``v``.
+
+    Raises:
+        NotImplementedError: If ``seqused_k`` is given.
+        ValueError: If a tensor has the wrong dtype or shape, or a descale is not ``[B, Hkv]``.
     """
+    if seqused_k is not None:
+        raise NotImplementedError(
+            "the backward does not support seqused_k; it would compute gradients over all Nk keys"
+        )
+    if not (q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn):
+        raise ValueError("q, k and v must be torch.float8_e4m3fn")
     B, Hq, Nq, d = q.shape
     Hkv, Nk = k.shape[1], k.shape[2]
+    if (
+        k.dim() != 4
+        or v.shape != k.shape
+        or k.shape[0] != B
+        or k.shape[3] != d
+        or d not in (64, 128)
+        or Hq % Hkv
+    ):
+        raise ValueError(
+            "need q [B, Hq, Nq, d] and k, v [B, Hkv, Nk, d] with d 64 or 128 and Hq a multiple of Hkv, "
+            f"got {tuple(q.shape)}, {tuple(k.shape)}, {tuple(v.shape)}"
+        )
+    if out.shape != q.shape or dout.shape != q.shape:
+        raise ValueError(
+            f"out and dout must be shaped like q {tuple(q.shape)}, got {tuple(out.shape)} and {tuple(dout.shape)}"
+        )
+    if lse.shape != (B, Hq, Nq) or pmax.shape != (B, Hq, Nq):
+        raise ValueError(
+            f"lse and pmax must be [B, Hq, Nq] = [{B}, {Hq}, {Nq}], got {tuple(lse.shape)} and {tuple(pmax.shape)}"
+        )
+    for x, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
+        check_descale(x, B, Hkv, name)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(d)
     if kb_major is None:
@@ -2012,6 +2050,7 @@ def attn_bwd(
     min_blocks=None,
     kb_major=None,
     dq_wg=None,
+    seqused_k=None,
 ):
     """Run the attention backward once.
 
@@ -2036,6 +2075,7 @@ def attn_bwd(
         min_blocks: As in ``make_attn_bwd``.
         kb_major: As in ``make_attn_bwd``.
         dq_wg: As in ``make_attn_bwd``.
+        seqused_k: As in ``make_attn_bwd``.
 
     Returns:
         ``(dq, dk, dv)`` in bf16.
@@ -2061,6 +2101,7 @@ def attn_bwd(
         min_blocks=min_blocks,
         kb_major=kb_major,
         dq_wg=dq_wg,
+        seqused_k=seqused_k,
     )
     launch()
     return finish()

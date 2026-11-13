@@ -477,7 +477,7 @@ class GemmSm120:
         m0 = pid_m * self.BM
         n0 = pid_n * self.BN
 
-        storage = cutlass.utils.SmemAllocator().allocate(self.shared_storage)
+        storage = cutlass.memory.SmemAllocator().allocate(self.shared_storage)
         nk = k // self.BK
         gc = Int64(mC.iterator.toint())
         gp = Int64(mPre.iterator.toint())
@@ -703,7 +703,7 @@ class GemmSm120:
         total = npm * npn
         nk = k // self.BK
 
-        storage = cutlass.utils.SmemAllocator().allocate(self.shared_storage)
+        storage = cutlass.memory.SmemAllocator().allocate(self.shared_storage)
         sbase = Int32(
             storage.a.get_tensor(
                 cute.make_layout(self.stages * self.BM * self.BK)
