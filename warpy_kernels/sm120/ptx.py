@@ -100,28 +100,36 @@ def mma_fp8(a, b, c, ta="e4m3", tb="e4m3", *, loc=None, ip=None):
 
 
 @dsl_user_op
-def mma_mxf8(a, b, c, *, loc=None, ip=None):
-    # `mma_fp8` with unit scales, twice as fast on SM120
+def mma_mxf8(a, b, c, sfa=0x7F, sfb=0x7F, *, loc=None, ip=None):
+    # `mma_fp8` with ue8m0 scales in byte 0, twice as fast on SM120
+    # lane L scales A row `L // 4 + 8 * (L % 2)`, the lanes of quad n scale B column n
     code = (
         "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
-        "{$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12, $13}, $14, {0, 0}, $14, {0, 0};"
+        "{$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12, $13}, $14, {0, 0}, $15, {0, 0};"
     )
     args = (
         [Int32(x) for x in a]
         + [Int32(x) for x in b]
         + [Float32(x) for x in c]
-        + [Int32(0x7F7F7F7F)]  # ue8m0 1.0 in every byte
+        + [Int32(sfa), Int32(sfb)]
     )
     res = asm(
         llvm.StructType.get_literal([T.f32()] * 4),
         args,
         code,
-        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f,r",
+        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f,r,r",
         False,
         loc,
         ip,
     )
     return unpack_struct(res, T.f32(), Float32, 4, loc, ip)
+
+
+@dsl_user_op
+def ue8m0_inv(g, *, loc=None, ip=None):
+    # ue8m0 byte of `1 / g` for a power of two `g`, from its exponent bits
+    code = "{\n\t.reg .b32 r;\n\tmov.b32 r, $1;\n\tshr.u32 r, r, 23;\n\tsub.s32 $0, 254, r;\n\t}"
+    return Int32(asm(T.i32(), [Float32(g)], code, "=r,f", False, loc, ip))
 
 
 @dsl_user_op

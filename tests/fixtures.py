@@ -12,10 +12,17 @@ class Ctx:
         self.notes = []
         self.data = {}
         self.failures = []
+        self.gated = set()
 
-    def metric(self, name, value, tol=None):
-        """Record ``value``; the test fails if ``tol`` is given and ``value`` is NaN or above it."""
+    def metric(self, name, value, tol=None, gate=None):
+        """Record ``value``; the test fails if ``tol`` is given and ``value`` is NaN or above it.
+
+        With ``--baseline``, a gated metric also fails when it is worse than the baseline run by more than
+        ``--slack``. Metrics with a ``tol`` are gated unless ``gate`` is ``False``.
+        """
         self.metrics.append((name, value, tol))
+        if gate if gate is not None else tol is not None:
+            self.gated.add(name)
         if tol is not None and not value <= tol:
             self.failures.append(f"{name} = {value:.3e} exceeds {tol:.1e}")
 
@@ -34,6 +41,32 @@ class Ctx:
 
 def rel_l2(a, b):
     return ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30)).item()
+
+
+def row_p99(a, b):
+    """99th percentile over rows of the per-row relative L2 error of ``a`` against ``b``.
+
+    Rows far below the typical row norm are measured against a tenth of the median row norm, so near-zero
+    reference rows don't dominate.
+    """
+    a, b = a.float().flatten(0, -2), b.float().flatten(0, -2)
+    ref = b.norm(dim=1)
+    floor = 0.1 * ref.median().clamp_min(1e-30)
+    return ((a - b).norm(dim=1) / torch.maximum(ref, floor)).quantile(0.99).item()
+
+
+def hard_inputs(B, Hq, Hkv, Nq, Nk, d, seed=0, logit_std=4.0, dout_spread=1.5):
+    """Peaky-softmax inputs with logits of standard deviation ``logit_std`` and dO row norms spread as ``exp(N(0, s))``.
+
+    Returns:
+        ``(q, k, v, dout)`` in float32.
+    """
+    q, k, v = randn_qkv(B, Hq, Hkv, Nq, Nk, d, seed)
+    g = torch.Generator(device="cuda").manual_seed(seed + 1000)
+    dout = torch.randn(B, Hq, Nq, d, device="cuda", generator=g)
+    dout = dout * torch.exp(dout_spread * torch.randn(B, Hq, Nq, 1, device="cuda", generator=g))
+    s = math.sqrt(logit_std)
+    return q * s, k * s, v, dout
 
 
 def randn_qkv(B, Hq, Hkv, Nq, Nk, d, seed=0):
@@ -152,22 +185,7 @@ def reference(q, k, v, causal):
     return out, lse
 
 
-def compare(ctx, q, k, v, dout, causal, tol, fwd_cfg=None, bwd_cfg=None):
-    """Run the kernels and the reference on ``q, k, v`` and record the errors of ``out``, ``lse`` and the gradients.
-
-    Rows that see no key must give ``O = 0`` and a non-finite ``lse``; the other rows are compared to the reference.
-
-    Args:
-        ctx: Test context.
-        q: Float32 queries ``[B, Hq, Nq, d]``.
-        k: Float32 keys ``[B, Hkv, Nk, d]``.
-        v: Float32 values ``[B, Hkv, Nk, d]``.
-        dout: Gradient of the output, or ``None`` for a forward-only comparison.
-        causal: Bottom-right aligned causal mask.
-        tol: Tolerances by metric name (``out``, ``lse``, ``dq``, ``dk``, ``dv``).
-        fwd_cfg: Forward kernel options.
-        bwd_cfg: Backward kernel options.
-    """
+def _errors(q, k, v, dout, causal, fwd_cfg, bwd_cfg):
     Nq, Nk = q.shape[2], k.shape[2]
     q, k, v = [x.detach().clone().requires_grad_(dout is not None) for x in (q, k, v)]
     out, lse = attention(q, k, v, causal, fwd_cfg, bwd_cfg)
@@ -183,25 +201,64 @@ def compare(ctx, q, k, v, dout, causal, tol, fwd_cfg=None, bwd_cfg=None):
     visible = torch.ones(Nq, dtype=torch.bool, device=q.device)
     if causal:
         visible = (torch.arange(Nq, device=q.device) + Nk - Nq) >= 0
-    ctx.metric("out", rel_l2(out[:, :, visible], out_ref[:, :, visible]), tol["out"])
-    ctx.metric(
-        "lse",
-        (lse[:, :, visible] - lse_ref[:, :, visible]).abs().max().item(),
-        tol["lse"],
-    )
-    ctx.expect(
-        bool((out[:, :, ~visible] == 0).all()),
-        "rows without a visible key must give O = 0",
-    )
-    ctx.expect(
-        not torch.isfinite(lse[:, :, ~visible]).any().item(),
-        "rows without a visible key must give a non-finite lse",
-    )
+    errs = {
+        "out": rel_l2(out[:, :, visible], out_ref[:, :, visible]),
+        "lse": (lse[:, :, visible] - lse_ref[:, :, visible]).abs().max().item(),
+    }
+    checks = [
+        (bool((out[:, :, ~visible] == 0).all()), "rows without a visible key must give O = 0"),
+        (not torch.isfinite(lse[:, :, ~visible]).any().item(), "rows without a visible key must give a non-finite lse"),
+    ]
     if dout is not None:
-        for name, got, want in (
-            ("dq", q.grad, qd.grad),
-            ("dk", k.grad, kd.grad),
-            ("dv", v.grad, vd.grad),
-        ):
-            ctx.metric(name, rel_l2(got, want), tol[name])
-            ctx.expect(not torch.isnan(got).any().item(), f"{name} contains NaN")
+        for name, got, want in (("dq", q.grad, qd.grad), ("dk", k.grad, kd.grad), ("dv", v.grad, vd.grad)):
+            errs[name] = rel_l2(got, want)
+            checks.append((not torch.isnan(got).any().item(), f"{name} contains NaN"))
+        errs["dq_p99"] = row_p99(q.grad, qd.grad)
+        errs["dk_p99"] = row_p99(k.grad, kd.grad)
+    return errs, checks
+
+
+def _record(ctx, errs, checks, tol):
+    for name, value in errs.items():
+        # worst-row errors have no fixed tolerance but are still checked against a baseline run
+        ctx.metric(name, value, tol.get(name), gate=True if name.endswith("_p99") else None)
+    for cond, message in checks:
+        ctx.expect(cond, message)
+
+
+def compare(ctx, q, k, v, dout, causal, tol, fwd_cfg=None, bwd_cfg=None):
+    """Run the kernels and the reference on ``q, k, v`` and record the errors of ``out``, ``lse`` and the gradients.
+
+    Rows that see no key must give ``O = 0`` and a non-finite ``lse``; the other rows are compared to the reference.
+    With ``dout``, the worst-row errors ``dq_p99`` and ``dk_p99`` are recorded too. See ``row_p99``.
+
+    Args:
+        ctx: Test context.
+        q: Float32 queries ``[B, Hq, Nq, d]``.
+        k: Float32 keys ``[B, Hkv, Nk, d]``.
+        v: Float32 values ``[B, Hkv, Nk, d]``.
+        dout: Gradient of the output, or ``None`` for a forward-only comparison.
+        causal: Bottom-right aligned causal mask.
+        tol: Tolerances by metric name (``out``, ``lse``, ``dq``, ``dk``, ``dv``, ``dq_p99``, ``dk_p99``); missing
+            names are recorded without a tolerance.
+        fwd_cfg: Forward kernel options.
+        bwd_cfg: Backward kernel options.
+    """
+    _record(ctx, *_errors(q, k, v, dout, causal, fwd_cfg, bwd_cfg), tol)
+
+
+def compare_seeds(ctx, make_inputs, seeds, causal, tol, fwd_cfg=None, bwd_cfg=None):
+    """Like ``compare``, but record each error as its mean over ``seeds``.
+
+    Args:
+        ctx: Test context.
+        make_inputs: Called with a seed; returns ``(q, k, v, dout)``.
+        seeds: Seeds to average over.
+        causal: Bottom-right aligned causal mask.
+        tol: Tolerances by metric name, applied to the means.
+        fwd_cfg: Forward kernel options.
+        bwd_cfg: Backward kernel options.
+    """
+    runs = [_errors(*make_inputs(seed), causal, fwd_cfg, bwd_cfg) for seed in seeds] # type: ignore
+    errs = {name: sum(r[0][name] for r in runs) / len(runs) for name in runs[0][0]}
+    _record(ctx, errs, [c for r in runs for c in r[1]], tol)
