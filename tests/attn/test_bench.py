@@ -36,6 +36,19 @@ def bench_fwd(ctx, d, causal, n, B=1, H=32):
     _record(ctx, flops, ms, ms_ref, best)
 
 
+@bench("fwd_bf16", d=[64, 128], causal=[False, True], n=SEQS)
+def bench_fwd_bf16(ctx, d, causal, n, B=1, H=32):
+    flops = 4 * B * H * n * n * d * (0.5 if causal else 1.0)
+    q, k, v = [x.to(torch.bfloat16) for x in randn_qkv(B, H, H, n, n, d)]
+    best, results = autotune_attn_fwd(q, k, v, causal=causal, iters=20, verbose=False)
+    ms = min(t for _, t in results if not isinstance(t, str))
+    ms_ref = time_launch_ms(lambda: _fa2(q, k, v, causal), 20)
+    ctx.metric(f"tf:{BASELINE}", flops / ms_ref / 1e9)
+    ctx.metric("tf:WarpAttention (bf16)", flops / ms / 1e9)
+    ctx.note(f"{ms_ref / ms:.2f}x {BASELINE}")
+    ctx.data["config"] = best
+
+
 @bench("bwd", d=[64, 128], causal=[False, True], n=SEQS)
 def bench_bwd(ctx, d, causal, n, B=1, H=32):
     flops = 10 * B * H * n * n * d * (0.5 if causal else 1.0)
@@ -49,6 +62,23 @@ def bench_bwd(ctx, d, causal, n, B=1, H=32):
     o = _fa2(q, k, v, causal)
     ms_ref = time_launch_ms(lambda: o.backward(dout, retain_graph=True), 10)
     _record(ctx, flops, ms, ms_ref, best)
+
+
+@bench("bwd_bf16", d=[64, 128], causal=[False, True], n=SEQS)
+def bench_bwd_bf16(ctx, d, causal, n, B=1, H=32):
+    flops = 10 * B * H * n * n * d * (0.5 if causal else 1.0)
+    q, k, v = [x.to(torch.bfloat16) for x in randn_qkv(B, H, H, n, n, d)]
+    out, lse, pmax = attn_fwd(q, k, v, causal=causal)
+    dout = torch.randn(B, H, n, d, device="cuda", dtype=torch.bfloat16)
+    best, results = autotune_attn_bwd(q, k, v, out, lse, pmax, dout, causal=causal, iters=10, verbose=False)
+    ms = min(t for _, t in results if not isinstance(t, str))
+    qg, kg, vg = [x.detach().clone().requires_grad_() for x in (q, k, v)]
+    o = _fa2(qg, kg, vg, causal)
+    ms_ref = time_launch_ms(lambda: o.backward(dout, retain_graph=True), 10)
+    ctx.metric(f"tf:{BASELINE}", flops / ms_ref / 1e9)
+    ctx.metric("tf:WarpAttention (bf16)", flops / ms / 1e9)
+    ctx.note(f"{ms_ref / ms:.2f}x {BASELINE}")
+    ctx.data["config"] = best
 
 
 @bench("cross", nq=[1024, 4096, 16384], nk=[128, 256, 512, 1024])

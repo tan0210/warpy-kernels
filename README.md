@@ -1,7 +1,7 @@
 # warpy-kernels
 
 CuTe DSL kernels for local LLMs. Currently supports SM120 only; further support
-will be made for SM89 and SM80.
+will be made for SM89 and SM86.
 
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cu130

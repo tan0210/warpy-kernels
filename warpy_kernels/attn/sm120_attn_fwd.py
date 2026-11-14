@@ -15,6 +15,8 @@ from ..sm120.ptx import (
     cp_async16,
     ldsm_x2_trans_b8,
     ldsm_x4,
+    ldsm_x4_trans,
+    mma_16816,
     mma_mxf8,
     pack_e4m3x4,
     pack_half2,
@@ -31,7 +33,7 @@ from ..utils import (
     tune_key,
     tune_lookup,
 )
-from .constants import E4M3_ONE_X4, LOG2E, P_OFFSET
+from .constants import BF16_ONE_X2, E4M3_ONE_X4, LOG2E, P_OFFSET
 
 
 class AttnFwdSm120:
@@ -54,8 +56,10 @@ class AttnFwdSm120:
         has_seqused: bool = False,
         lse_natural: bool = False,
         warp_spec: bool = False,
+        bf16: bool = False,
     ):
         assert head_dim in (64, 128) and block_n in (64, 128)
+        assert not (bf16 and tma), "bf16 inputs load with cp.async"
         assert num_stages >= (3 if pipelined else 2)
         self.d = head_dim
         self.causal = causal
@@ -73,8 +77,12 @@ class AttnFwdSm120:
         self.has_seqused = has_seqused
         self.lse_natural = lse_natural
         self.sw_bits = 3 if head_dim == 128 else 2
-        self.q_bytes = self.BM * head_dim
-        self.kv_tile_bytes = self.BN * head_dim
+        self.bf16 = bf16
+        # bf16 P needs no offset against underflow
+        self.p_off = 0.0 if bf16 else P_OFFSET
+        self.row_bytes = head_dim * (2 if bf16 else 1)
+        self.q_bytes = self.BM * self.row_bytes
+        self.kv_tile_bytes = self.BN * self.row_bytes
         self.k_off = self.q_bytes
         self.v_off = self.q_bytes + num_stages * self.kv_tile_bytes
         self.smem_bytes = self.q_bytes + 2 * num_stages * self.kv_tile_bytes
@@ -109,10 +117,10 @@ class AttnFwdSm120:
         self.shared_storage = SharedStorage
 
     def _swz_off(self, row, chunk):
-        return swizzle_offset(self.d, row, chunk)
+        return swizzle_offset(self.row_bytes, row, chunk)
 
     def _load_rows(self, s_addr, g_addr, nrows, tidx, row_stride):
-        chunks = self.d // 16
+        chunks = self.row_bytes // 16
         for i in range(nrows * chunks // self.NUM_THREADS):
             idx = tidx + i * self.NUM_THREADS
             row = idx // chunks
@@ -196,14 +204,14 @@ class AttnFwdSm120:
     ):
         kbase = sbase + self.k_off + (jt % self.stages) * self.kv_tile_bytes
         acc.fill(0.0)
-        for kk in cutlass.range_constexpr(self.d // 32):
+        for kk in cutlass.range_constexpr(self.row_bytes // 32):
             for npair in cutlass.range_constexpr(self.nt // 2):
                 key = (lane % 8) + (lane // 16) * 8 + 16 * npair
                 ch = (lane // 8) % 2 + 2 * kk
                 bfr = ldsm_x4(kbase + self._swz_off(key, ch))
                 for h in cutlass.range_constexpr(2):
                     nt = 2 * npair + h
-                    c = mma_mxf8(
+                    c = self._mma(
                         [qf[4 * kk], qf[4 * kk + 1], qf[4 * kk + 2], qf[4 * kk + 3]],
                         [bfr[2 * h], bfr[2 * h + 1]],
                         [
@@ -215,6 +223,11 @@ class AttnFwdSm120:
                     )
                     for x in cutlass.range_constexpr(4):
                         acc[4 * nt + x] = c[x]
+
+    def _mma(self, a, b, c):
+        if self.bf16:
+            return mma_16816(a, b, c, "bf16")
+        return mma_mxf8(a, b, c)
 
     @cute.jit
     def _mask(
@@ -274,7 +287,7 @@ class AttnFwdSm120:
                 o_acc[4 * nt + 2 * r + 1] = o_acc[4 * nt + 2 * r + 1] * corr
             l_acc[2 * r] = l_acc[2 * r] * corr
             l_acc[2 * r + 1] = l_acc[2 * r + 1] * corr
-            bias = Float32(P_OFFSET) - m_safe  # base-2 exponent plus the `2^8` offset
+            bias = Float32(self.p_off) - m_safe  # base-2 exponent plus the e4m3 offset
             for nt in cutlass.range_constexpr(self.nt):
                 for e in cutlass.range_constexpr(2):
                     idx = 4 * nt + 2 * r + e
@@ -291,6 +304,13 @@ class AttnFwdSm120:
         l_acc: cute.Tensor,
     ):
         vbase = sbase + self.v_off + (jt % self.stages) * self.kv_tile_bytes
+        if const_expr(self.bf16):
+            self._pv_bf16(vbase, acc, o_acc, l_acc)
+        else:
+            self._pv_e4m3(vbase, v_key, acc, o_acc, l_acc)
+
+    @cute.jit
+    def _pv_e4m3(self, vbase, v_key, acc, o_acc, l_acc):
         ones = Int32(E4M3_ONE_X4)
         for kk2 in cutlass.range_constexpr(self.BN // 32):
             t0 = 4 * kk2
@@ -333,6 +353,44 @@ class AttnFwdSm120:
                     )
                     for x in cutlass.range_constexpr(4):
                         o_acc[4 * nt + x] = c[x]
+
+    @cute.jit
+    def _pv_bf16(self, vbase, acc, o_acc, l_acc):
+        lane = cute.arch.thread_idx()[0] % 32
+        ones = Int32(BF16_ONE_X2)
+        for kk in cutlass.range_constexpr(self.BN // 16):
+            nt = 2 * kk
+            # P of 16 keys as the A operand: rows g and g + 8, then keys + 8
+            pa = [
+                pack_half2(acc[4 * nt], acc[4 * nt + 1], "bf16"),
+                pack_half2(acc[4 * nt + 2], acc[4 * nt + 3], "bf16"),
+                pack_half2(acc[4 * nt + 4], acc[4 * nt + 5], "bf16"),
+                pack_half2(acc[4 * nt + 6], acc[4 * nt + 7], "bf16"),
+            ]
+            # row sums of the same rounded P
+            c = mma_16816(
+                pa, [ones, ones], [l_acc[0], l_acc[1], l_acc[2], l_acc[3]], "bf16"
+            )
+            for x in cutlass.range_constexpr(4):
+                l_acc[x] = c[x]
+            key = 16 * kk + (lane % 8) + ((lane // 8) % 2) * 8
+            for npair in cutlass.range_constexpr(self.d // 16):
+                vb = ldsm_x4_trans(vbase + self._swz_off(key, 2 * npair + lane // 16))
+                for h in cutlass.range_constexpr(2):
+                    on = 2 * npair + h
+                    c = mma_16816(
+                        pa,
+                        [vb[2 * h], vb[2 * h + 1]],
+                        [
+                            o_acc[4 * on],
+                            o_acc[4 * on + 1],
+                            o_acc[4 * on + 2],
+                            o_acc[4 * on + 3],
+                        ],
+                        "bf16",
+                    )
+                    for x in cutlass.range_constexpr(4):
+                        o_acc[4 * on + x] = c[x]
 
     @cute.jit
     def _tile(
@@ -561,7 +619,7 @@ class AttnFwdSm120:
         tv,
     ):
         d = self.d
-        kq_steps = d // 32
+        kq_steps = self.row_bytes // 32
         o_tiles = d // 8
 
         tidx, _, _ = cute.arch.thread_idx()
@@ -772,7 +830,9 @@ class AttnFwdSm120:
                 valid = lsum > Float32(0.0)
                 inv = sv / lsum if valid else Float32(0.0)
                 lse = (
-                    row_max[r] + cute.math.log2(lsum, fastmath=True) - Float32(P_OFFSET)
+                    row_max[r]
+                    + cute.math.log2(lsum, fastmath=True)
+                    - Float32(self.p_off)
                     if valid
                     else Float32(math.inf)
                 )
@@ -822,6 +882,22 @@ FWD_DEFAULTS = {
     128: {"pipelined": False, "num_stages": 2, "block_n": 128, "tma": True},
     64: {"pipelined": True, "num_stages": 3, "block_n": 128, "tma": True},
 }
+# bf16 rows are twice as wide, so fewer and smaller K/V stages fit
+FWD_CANDIDATES_BF16 = {
+    128: [
+        {"pipelined": False, "num_stages": 2, "block_n": 64},
+    ],
+    64: [
+        {"pipelined": True, "num_stages": 3, "block_n": 64},
+        {"pipelined": True, "num_stages": 4, "block_n": 64},
+        {"pipelined": False, "num_stages": 2, "block_n": 128},
+        {"pipelined": False, "num_stages": 2, "block_n": 64},
+    ],
+}
+FWD_DEFAULTS_BF16 = {
+    128: {"pipelined": False, "num_stages": 2, "block_n": 64},
+    64: {"pipelined": True, "num_stages": 3, "block_n": 64},
+}
 
 
 def _kernel_view(x, n_pad):
@@ -862,13 +938,14 @@ def make_attn_fwd(
     ``launch()`` may not see later in-place changes to the inputs. Call ``make_attn_fwd`` again for new values.
 
     Args:
-        q: ``[B, Hq, Nq, d]`` ``torch.float8_e4m3fn``. ``d`` is 64 or 128. Any strides work if the last one is 1,
-            such as a transposed ``[B, N, H, d]`` tensor. Inputs are copied if a stride or the base address is
-            not a multiple of 16 bytes, or if ``Nq`` is not a multiple of 128.
-        k: ``[B, Hkv, Nk, d]`` ``torch.float8_e4m3fn``, with the same stride rules. ``Hq`` must be a multiple of
-            ``Hkv``. ``Nk`` must be a multiple of ``block_n`` unless ``tma`` is on, or it is copied.
+        q: ``[B, Hq, Nq, d]`` ``torch.float8_e4m3fn`` or ``torch.bfloat16``. ``d`` is 64 or 128. Any strides work if
+            the last one is 1, such as a transposed ``[B, N, H, d]`` tensor. Inputs are copied if a stride or the
+            base address is not a multiple of 16 bytes, or if ``Nq`` is not a multiple of 128.
+        k: ``[B, Hkv, Nk, d]``, same dtype as ``q`` and the same stride rules. ``Hq`` must be a multiple of ``Hkv``.
+            ``Nk`` must be a multiple of ``block_n`` unless ``tma`` is on, or it is copied.
         v: Same shape and dtype as ``k``.
-        q_descale: ``[B, Hkv]`` float32 dequantization scale, or ``None`` for 1.
+        q_descale: ``[B, Hkv]`` float32 dequantization scale for e4m3 inputs, or ``None`` for 1. bf16 inputs take
+            no descales.
         k_descale: Same as ``q_descale``, for ``k``.
         v_descale: Same as ``q_descale``, for ``v``.
         causal: Whether to apply a bottom-right aligned causal mask.
@@ -882,7 +959,7 @@ def make_attn_fwd(
             accurate.
         lpt: Whether to launch the longest causal CTAs first. ``None`` enables it for causal attention only.
         tma: Whether to load K and V with TMA instead of ``cp.async``. Q always uses ``cp.async``. ``None``
-            takes the autotuned or built-in choice.
+            takes the autotuned or built-in choice. bf16 inputs always use ``cp.async``.
         out: Output buffer, ``[B, Hq, Nq, d]`` bf16 with last stride 1 and even other strides. ``None`` allocates
             one with the memory layout of ``q``.
         return_lse: Whether to compute ``lse`` and ``pmax``. The backward pass needs them.
@@ -900,13 +977,22 @@ def make_attn_fwd(
         ``lse`` and ``pmax`` are ``None`` if ``return_lse`` is false.
 
     Raises:
-        ValueError: If ``q``, ``k`` or ``v`` has the wrong dtype or shape, a descale is not ``[B, Hkv]``, ``out``
-            has the wrong shape, dtype or strides, or ``seqused_k`` is not an int32 CUDA tensor of shape ``[B]``.
+        ValueError: If ``q``, ``k`` or ``v`` has the wrong dtype or shape, a descale is not ``[B, Hkv]`` or is given
+            for bf16 inputs, ``out`` has the wrong shape, dtype or strides, or ``seqused_k`` is not an int32 CUDA
+            tensor of shape ``[B]``.
     """
     B, Hq, Nq, d = q.shape
     Hkv, Nk = k.shape[1], k.shape[2]
-    if not (q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn):
-        raise ValueError("q, k and v must be torch.float8_e4m3fn")
+    if not (
+        q.dtype == k.dtype == v.dtype
+        and q.dtype in (torch.float8_e4m3fn, torch.bfloat16)
+    ):
+        raise ValueError(
+            "q, k and v must all be torch.float8_e4m3fn or all torch.bfloat16"
+        )
+    bf16 = q.dtype == torch.bfloat16
+    if bf16 and not (q_descale is None and k_descale is None and v_descale is None):
+        raise ValueError("descales apply to float8_e4m3fn inputs only")
     if (
         k.dim() != 4
         or v.shape != k.shape
@@ -935,8 +1021,10 @@ def make_attn_fwd(
         or warp_spec is None
     ):
         tuned = (
-            tune_lookup(tune_key("fwd", d, causal, Nq, Nk, Hq // Hkv))
-            or FWD_DEFAULTS[d]
+            tune_lookup(
+                tune_key("fwd_bf16" if bf16 else "fwd", d, causal, Nq, Nk, Hq // Hkv)
+            )
+            or (FWD_DEFAULTS_BF16 if bf16 else FWD_DEFAULTS)[d]
         )
         num_stages = tuned["num_stages"] if num_stages is None else num_stages
         pipelined = tuned["pipelined"] if pipelined is None else pipelined
@@ -945,7 +1033,8 @@ def make_attn_fwd(
         warp_spec = (
             bool(tuned.get("warp_spec", False)) if warp_spec is None else warp_spec
         )
-    warp_spec = bool(warp_spec) and bool(tma)
+    tma = bool(tma) and not bf16
+    warp_spec = bool(warp_spec) and tma
     if lpt is None:
         lpt = causal
     dev = q.device
@@ -1020,6 +1109,7 @@ def make_attn_fwd(
         seqused_k is not None,
         lse_natural,
         warp_spec,
+        bf16,
     )
     compiled = compile_cached(
         AttnFwdSm120, ctor, (B, Hq, Hkv, nq_pad, nk_pad), *targs, *sargs
@@ -1134,7 +1224,7 @@ def autotune_attn_fwd(
         softmax_scale: As in ``make_attn_fwd``.
         candidates: Config dicts with keys ``pipelined``, ``num_stages``, ``block_n``, ``tma`` and ``warp_spec``.
             Defaults to every config in ``FWD_CANDIDATES`` for the head dim, with ``cp.async``, TMA, and TMA
-            with a producer warp group.
+            with a producer warp group, or to ``FWD_CANDIDATES_BF16`` for bf16 inputs.
         iters: Timed launches per candidate.
         verbose: Whether to print one line per candidate.
 
@@ -1145,9 +1235,12 @@ def autotune_attn_fwd(
         RuntimeError: If no candidate runs.
     """
     d = q.shape[-1]
+    bf16 = q.dtype == torch.bfloat16
     if candidates is None:
         candidates = (
-            FWD_CANDIDATES[d]
+            FWD_CANDIDATES_BF16[d]
+            if bf16
+            else FWD_CANDIDATES[d]
             + [dict(c, tma=True) for c in FWD_CANDIDATES[d]]
             + [dict(c, tma=True, warp_spec=True) for c in FWD_CANDIDATES[d]]
         )
@@ -1158,7 +1251,7 @@ def autotune_attn_fwd(
         )[0]
 
     return autotune(
-        "fwd",
+        "fwd_bf16" if bf16 else "fwd",
         d,
         causal,
         q.shape[2],

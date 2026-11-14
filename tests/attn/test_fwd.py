@@ -1,3 +1,5 @@
+import torch
+
 from tests.fixtures import (
     attention,
     compare,
@@ -9,6 +11,8 @@ from tests.fixtures import (
     sink_qkv,
 )
 from tests.registry import case
+from warpy_kernels import attn_fwd
+from warpy_kernels.attn.sm120_attn_fwd import FWD_CANDIDATES_BF16
 
 TOL = {"out": 6e-2, "lse": 5e-2}
 
@@ -85,3 +89,35 @@ def sink(ctx, gap):
             ctx.metric("out", err, 2e-2)
         else:
             ctx.note(f"running-max reference: out {err:.2e}")
+
+
+BF16_TOL = {"out": 1e-2, "lse": 1e-2}
+
+
+def _bf16_compare(ctx, shape, causal, fwd_cfg=None):
+    Nq, Nk = shape[3], shape[4]
+    q, k, v = [x.to(torch.bfloat16) for x in randn_qkv(*shape)]
+    out, lse, _ = attn_fwd(q, k, v, causal=causal, **(fwd_cfg or {}))
+    out_ref, lse_ref = reference(q.float(), k.float(), v.float(), causal)
+    visible = torch.ones(Nq, dtype=torch.bool, device=q.device)
+    if causal:
+        visible = (torch.arange(Nq, device=q.device) + Nk - Nq) >= 0
+    ctx.metric("out", rel_l2(out[:, :, visible], out_ref[:, :, visible]), BF16_TOL["out"])
+    ctx.metric("lse", (lse[:, :, visible] - lse_ref[:, :, visible]).abs().max().item(), BF16_TOL["lse"])
+    ctx.expect(bool((out[:, :, ~visible] == 0).all()), "rows without a visible key must give O = 0")
+
+
+@case("fwd_bf16", shape=SHAPES, causal=[False, True])
+def fwd_bf16(ctx, shape, causal):
+    _bf16_compare(ctx, shape, causal)
+
+
+@case(
+    "fwd_bf16_cfg",
+    where=lambda shape, fwd_cfg, **_: fwd_cfg in FWD_CANDIDATES_BF16[shape[5]],
+    shape=[SHAPES[1], SHAPES[4], SHAPES[5], SHAPES[6]],
+    causal=[False, True],
+    fwd_cfg=[c for i, c in enumerate(FWD_CANDIDATES_BF16[64]) if c not in FWD_CANDIDATES_BF16[64][:i]],
+)
+def fwd_bf16_cfg(ctx, shape, causal, fwd_cfg):
+    _bf16_compare(ctx, shape, causal, fwd_cfg)

@@ -8,7 +8,7 @@ from .gemm import CANDIDATES, FP8_CANDIDATES, GemmSm120
 from .utils import compile_cached, flat, time_candidates
 
 _TYPES = {torch.bfloat16: "bf16", torch.float16: "f16"}
-SUPPORTED = "float8_e4m3fn on compute capability 12.0 (SM120)"
+SUPPORTED = "compute capability 12.0 (SM120)"
 
 
 def make_gemm(
@@ -296,10 +296,11 @@ def autotune_gemm(a, b, candidates=None, iters=20, verbose=True, **kwargs):
     )
 
 
-def _check(q, what):
-    if q.dtype != torch.float8_e4m3fn:
+def _check(q, what, dtypes):
+    if q.dtype not in dtypes:
+        names = " and ".join(str(t).removeprefix("torch.") for t in dtypes)
         raise NotImplementedError(
-            f"warpy_kernels has no {what} for {q.dtype} yet; supported: {SUPPORTED}"
+            f"warpy_kernels has no {what} for {q.dtype} yet; supported: {names} on {SUPPORTED}"
         )
     capability = torch.cuda.get_device_capability(q.device)
     if capability != (12, 0):
@@ -330,7 +331,7 @@ def attn_fwd(
         v_descale: Same as ``q_descale``, for ``v``.
         causal: Whether to apply a bottom-right aligned causal mask.
         softmax_scale: Scale on the logits. Defaults to ``1 / sqrt(d)``.
-        **config: Kernel-specific options. See ``warpy_kernels.attn.attn_fwd`` for ``float8_e4m3fn``.
+        **config: Kernel-specific options. See ``warpy_kernels.attn.attn_fwd`` for ``float8_e4m3fn`` and ``bfloat16``.
 
     Returns:
         ``(out, lse, pmax)``. ``out`` is ``[B, Hq, Nq, d]`` bf16, ``lse`` is the ``[B, Hq, Nq]`` base-2
@@ -340,7 +341,7 @@ def attn_fwd(
     Raises:
         NotImplementedError: If there is no kernel for the dtype or the GPU.
     """
-    _check(q, "forward kernel")
+    _check(q, "forward kernel", (torch.float8_e4m3fn, torch.bfloat16))
     return sm120_attn_fwd(
         q, k, v, q_descale, k_descale, v_descale, causal, softmax_scale, **config
     )
@@ -376,7 +377,7 @@ def attn_bwd(
         v_descale: The ``v_descale`` given to ``attn_fwd``.
         causal: The ``causal`` given to ``attn_fwd``.
         softmax_scale: The ``softmax_scale`` given to ``attn_fwd``.
-        **config: Kernel-specific options. See ``warpy_kernels.attn.attn_bwd`` for ``float8_e4m3fn``.
+        **config: Kernel-specific options. See ``warpy_kernels.attn.attn_bwd`` for ``float8_e4m3fn`` and ``bfloat16``.
 
     Returns:
         ``(dq, dk, dv)`` in bf16: gradients with respect to the dequantized ``q``, ``k`` and ``v``.
@@ -384,7 +385,7 @@ def attn_bwd(
     Raises:
         NotImplementedError: If there is no kernel for the dtype or the GPU.
     """
-    _check(q, "backward kernel")
+    _check(q, "backward kernel", (torch.float8_e4m3fn, torch.bfloat16))
     return sm120_attn_bwd(
         q,
         k,

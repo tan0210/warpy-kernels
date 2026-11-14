@@ -437,6 +437,19 @@ def st_shared_v2_f32(saddr, v0, v1, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def stsm_x4_trans(addr, r0, r1, r2, r3, *, loc=None, ip=None):
+    asm(
+        None,
+        [Int32(addr), Int32(r0), Int32(r1), Int32(r2), Int32(r3)],
+        "stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r,~{memory}",
+        True,
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
 def st_shared_e4m3_pair(addr_lo, addr_hi, x_lo, x_hi, *, loc=None, ip=None):
     code = (
         "{\n\t.reg .b16 h, h2;\n\t"
@@ -515,6 +528,8 @@ def warp_sync(*, loc=None, ip=None):
 
 
 def swizzle_offset(row_bytes, row, chunk):
+    if row_bytes == 256:  # two 128-byte halves, each with the 128B swizzle
+        return row * 256 + ((((chunk & 7) ^ (row & 7)) | (chunk & 8)) << 4)
     if row_bytes == 128:  # 128B swizzle
         return row * 128 + (((row & 7) ^ chunk) << 4)
     return row * 64 + ((((row >> 1) & 3) ^ chunk) << 4)  # 64B swizzle
