@@ -11,6 +11,11 @@ _TYPES = {torch.bfloat16: "bf16", torch.float16: "f16"}
 SUPPORTED = "compute capability 12.0 (SM120)"
 
 
+def _bytes_arg(x):
+    # read by address, so one compile serves every shape
+    return from_dlpack(x.reshape(-1).view(torch.uint8)).mark_layout_dynamic()
+
+
 def _scale_arg(s):
     s = from_dlpack(s.reshape(-1))
     # vector scales are read by address, so one compile serves every length
@@ -40,6 +45,8 @@ def make_gemm(
     a_trans=False,
     b_trans=False,
     accum=False,
+    a_scale_mx=None,
+    out_mx=False,
 ):
     """Prepare ``out = op(a) @ op(b).T * scale_a * scale_b`` on SM120, with vector scales broadcast as ``[M, 1]`` and ``[N]``.
 
@@ -78,10 +85,16 @@ def make_gemm(
         accum: Whether to add the scaled product to the values ``out`` already holds. The sum is formed before
             the activation, so ``act="gelu"`` gives ``gelu(product + out)`` and ``act="dgelu"`` gives
             ``(product + out) * gelu'(pre)``. Needs ``out``.
+        a_scale_mx: ``[M, K / 32]`` uint8 ue8m0 scales of ``a``, one per row and block of 32 along K, as
+            ``out_mx`` writes them. Needs fp8 inputs. Combines with ``scale_a`` and ``scale_b``.
+        out_mx: Whether to also write the result as MXFP8: e4m3 values ``[M, N]`` and ``[M, N / 32]`` uint8
+            ue8m0 scales, one per row and block of 32 columns. The values are the ones ``out`` receives, after
+            ``accum`` and ``act``, each block scaled by the smallest power of two that keeps it within 448.
 
     Returns:
         ``(launch, out)``, or ``(launch, out, pre)`` if ``act="gelu"``, where ``pre`` is ``None`` unless
-        ``store_pre`` is set. ``launch()`` runs the kernel and fills the outputs.
+        ``store_pre`` is set. With ``out_mx``, the e4m3 values and their scales follow. ``launch()`` runs the
+        kernel and fills the outputs.
 
     Raises:
         ValueError: If the dtype is unsupported, the shapes do not match, an input is not contiguous, or
@@ -159,6 +172,15 @@ def make_gemm(
                 f"{name} must be a float32 CUDA tensor of 1 or {size} elements, contiguous and 8-byte aligned"
             )
     row_scale = scale_a.numel() > 1
+    if a_scale_mx is not None and (
+        not fp8
+        or a_scale_mx.dtype != torch.uint8
+        or a_scale_mx.shape != (m, k // 32)
+        or not a_scale_mx.is_contiguous()
+    ):
+        raise ValueError(f"a_scale_mx must be a contiguous [{m}, {k // 32}] uint8 tensor with fp8 inputs")
+    q_mx = torch.empty(m, n, dtype=torch.float8_e4m3fn, device=a.device) if out_mx else None
+    s_mx = torch.empty(m, n // 32, dtype=torch.uint8, device=a.device) if out_mx else None
     col_scale = scale_b.numel() > 1
     # fp8 is passed as raw bytes
     raw = (lambda x: x.view(torch.uint8)) if fp8 else (lambda x: x)
@@ -173,6 +195,9 @@ def make_gemm(
         _scale_arg(scale_b),
         flat(sk_ws),
         flat(sk_flags),
+        _bytes_arg(q_mx if out_mx else out),
+        _bytes_arg(s_mx if out_mx else out),
+        _bytes_arg(a_scale_mx if a_scale_mx is not None else out),
         Int32(m),
         Int32(n),
         Int32(k),
@@ -198,13 +223,16 @@ def make_gemm(
         accum,
         row_scale,
         col_scale,
+        a_scale_mx is not None,
+        out_mx,
     )
     kernel = compile_cached(GemmSm120, ctor, (), *args)
 
     def launch():
         kernel(*args)
 
-    return (launch, out, pre_out) if act == "gelu" else (launch, out)
+    mx = (q_mx, s_mx) if out_mx else ()
+    return (launch, out, pre_out, *mx) if act == "gelu" else (launch, out, *mx)
 
 
 def gemm(
@@ -230,6 +258,8 @@ def gemm(
     a_trans=False,
     b_trans=False,
     accum=False,
+    a_scale_mx=None,
+    out_mx=False,
 ):
     """Compute ``(a @ b.T) * scale_a * scale_b`` on SM120.
 
@@ -256,11 +286,14 @@ def gemm(
         a_trans: As in ``make_gemm``.
         b_trans: As in ``make_gemm``.
         accum: As in ``make_gemm``.
+        a_scale_mx: As in ``make_gemm``.
+        out_mx: As in ``make_gemm``.
 
     Returns:
-        ``[M, N]`` in the output dtype, or ``(out, pre)`` if ``act`` is set.
+        ``[M, N]`` in the output dtype, or ``(out, pre)`` if ``act`` is set. With ``out_mx``, a tuple that
+        ends with the e4m3 values and their scales.
     """
-    launch, out, *pre = make_gemm(
+    launch, out, *rest = make_gemm(
         a,
         b,
         out,
@@ -283,9 +316,12 @@ def gemm(
         a_trans,
         b_trans,
         accum,
+        a_scale_mx,
+        out_mx,
     )
     launch()
-    return (out, pre[0]) if act == "gelu" else out
+    res = (out, *rest) if act == "gelu" or out_mx else out
+    return res
 
 
 def autotune_gemm(a, b, candidates=None, iters=20, verbose=True, **kwargs):

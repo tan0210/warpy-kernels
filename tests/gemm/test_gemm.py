@@ -97,6 +97,58 @@ def vector_scales(ctx, dtype, config, shape):
     ctx.metric("pre", rel_l2(pre.float(), x), tol)
 
 
+MX_FP8_CONFIGS = {**FP8_CONFIGS, "cp.async-frag": {"bk": 128, "stages": 2, "frag_pipe": True}}
+
+
+def _mx_dequant(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    return q.float() * torch.exp2(s.float() - 127).repeat_interleave(32, dim=1)
+
+
+@case(
+    "mx_output",
+    where=lambda dtype, config, shape: config in (MX_FP8_CONFIGS if dtype == "fp8" else CONFIGS),
+    dtype=["fp8", "bf16"],
+    config=sorted({*CONFIGS, *MX_FP8_CONFIGS}),
+    shape=SHAPES,
+)
+def mx_output(ctx, dtype, config, shape):
+    m, n, k = shape
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    a = torch.randn(m, k, device="cuda", generator=gen)
+    b = torch.randn(n, k, device="cuda", generator=gen)
+    c0 = torch.randn(m, n, device="cuda", generator=gen).bfloat16()
+    if dtype == "fp8":
+        a, b, cfg = a.to(FP8), b.to(FP8), MX_FP8_CONFIGS[config]
+    else:
+        a, b, cfg = a.bfloat16(), b.bfloat16(), CONFIGS[config]
+    out, q, sc = cast(tuple, wk.gemm(a, b, out_mx=True, **cfg))
+    ctx.metric("dequant_vs_out", rel_l2(_mx_dequant(q, sc), out.float()), 4e-2)
+    peak = (q.float().abs().view(m, n // 32, 32).amax(-1))
+    ctx.expect(bool(((peak >= 224) & (peak <= 448)).all()), "block scales are not tight")
+    post, pre, q, sc = cast(tuple, wk.gemm(a, b, out=c0.clone(), accum=True, act="gelu", store_pre=True, out_mx=True, **cfg))
+    ctx.metric("gelu_dequant_vs_out", rel_l2(_mx_dequant(q, sc), post.float()), 4e-2)
+
+
+@case("mx_input", config=sorted(MX_FP8_CONFIGS), shape=SHAPES)
+def mx_input(ctx, config, shape):
+    m, n, k = shape
+    cfg = MX_FP8_CONFIGS[config]
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    a = torch.randn(m, k, device="cuda", generator=gen).to(FP8)
+    b = torch.randn(n, k, device="cuda", generator=gen).to(FP8)
+    sc = torch.randint(118, 136, (m, k // 32), device="cuda", generator=gen, dtype=torch.uint8)
+    cols = torch.rand(n, device="cuda", generator=gen) + 0.5
+    want = (_mx_dequant(a, sc) @ b.float().T) * cols
+    got = _mm(a, b, a_scale_mx=sc, scale_b=cols, **cfg).float()
+    ctx.metric("rel_l2", rel_l2(got, want), 1e-2)
+    # a chain: the MX output of one product is the A operand of the next
+    x = torch.randn(m, k, device="cuda", generator=gen).to(FP8)
+    w2 = torch.randn(n, n, device="cuda", generator=gen).to(FP8)
+    h, hq, hs = cast(tuple, wk.gemm(x, b, out_mx=True, **cfg))
+    y = _mm(hq, w2, a_scale_mx=hs, **cfg).float()
+    ctx.metric("chain", rel_l2(y, h.float() @ w2.float().T), 5e-2)
+
+
 @case(
     "matches_cublas",
     where=lambda dtype, config, shape: config in (FP8_CONFIGS if dtype == "fp8" else CONFIGS),

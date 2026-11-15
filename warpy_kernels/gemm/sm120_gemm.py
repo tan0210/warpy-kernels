@@ -8,6 +8,13 @@ from cutlass.cute.nvgpu import cpasync
 
 from ..sm120.ptx import (
     SMEM_LIMIT,
+    abs_bits,
+    join_b16,
+    ld_global_nc_u8,
+    mx_scale,
+    pack_e4m3x2,
+    st_global_u8,
+    st_global_v2_b32,
     cp_async16,
     fence_gpu,
     ld_global_b32,
@@ -55,7 +62,12 @@ class GemmSm120:
         accum: bool = False,
         row_scale: bool = False,
         col_scale: bool = False,
+        a_mx: bool = False,
+        out_mx: bool = False,
     ):
+        assert fp8 or not a_mx, "MX scales on A need fp8 inputs"
+        self.a_mx = a_mx
+        self.out_mx = out_mx
         self.accum = accum
         self.row_scale = row_scale
         self.col_scale = col_scale
@@ -322,7 +334,9 @@ class GemmSm120:
             cute.arch.mbarrier_arrive(self._empty + it % self.stages)  # stage is free
 
     @cute.jit
-    def _mma(self, a, b, c):
+    def _mma(self, a, b, c, sfa=0x7F):
+        if const_expr(self.a_mx):
+            return mma_mxf8(a, b, c, sfa=sfa)
         if const_expr(self.fp8):
             return mma_mxf8(a, b, c)
         else:
@@ -342,7 +356,19 @@ class GemmSm120:
                 fb[buf * 2 * self.NT + nj * 4 + x] = r[x]
 
     @cute.jit
-    def _mma_step(self, buf, fa, fb, acc):
+    def _sfa(self, sfp, sf16, kt, kk):
+        # this lane's A-row scale in each m16 tile, for k32 step `kk` of k-tile `kt`
+        out = []
+        for mi in cutlass.range_constexpr(4):
+            if const_expr(self.a_mx):
+                out.append(ld_global_nc_u8(sfp + Int64(mi) * sf16 + Int64(kt * self.KK + kk)))
+            else:
+                out.append(Int32(0x7F))
+        return out
+
+    @cute.jit
+    def _mma_step(self, buf, fa, fb, acc, sfp, sf16, kt, kk):
+        sfa = self._sfa(sfp, sf16, kt, kk)
         for nj in cutlass.range_constexpr(self.NT // 2):
             for h in cutlass.range_constexpr(2):
                 nt = 2 * nj + h
@@ -354,15 +380,18 @@ class GemmSm120:
                     o = (mi * self.NT + nt) * 4
                     ao = buf * 16 + mi * 4
                     a = [fa[ao], fa[ao + 1], fa[ao + 2], fa[ao + 3]]
-                    c = self._mma(a, b, [acc[o], acc[o + 1], acc[o + 2], acc[o + 3]])
+                    c = self._mma(
+                        a, b, [acc[o], acc[o + 1], acc[o + 2], acc[o + 3]], sfa[mi]
+                    )
                     for x in cutlass.range_constexpr(4):
                         acc[o + x] = c[x]
 
     @cute.jit
-    def _compute(self, st, sbase, warp_m, warp_n, lane, acc):
+    def _compute(self, st, sbase, warp_m, warp_n, lane, acc, sfp, sf16, kt):
         sa = sbase + st * self.a_bytes
         sb = sbase + self.stages * self.a_bytes + st * self.b_bytes
         for kk in cutlass.range_constexpr(self.KK):
+            sfa = self._sfa(sfp, sf16, kt, kk)
             a = []
             for mi in cutlass.range_constexpr(4):
                 a.append(self._a_frag(sa, warp_m, mi, kk, lane))
@@ -376,6 +405,7 @@ class GemmSm120:
                             a[mi],
                             [b[2 * h], b[2 * h + 1]],
                             [acc[o], acc[o + 1], acc[o + 2], acc[o + 3]],
+                            sfa[mi],
                         )
                         for x in cutlass.range_constexpr(4):
                             acc[o + x] = c[x]
@@ -391,6 +421,9 @@ class GemmSm120:
         mSB: cute.Tensor,
         mWs: cute.Tensor,
         mFlags: cute.Tensor,
+        mQ: cute.Tensor,
+        mQS: cute.Tensor,
+        mASF: cute.Tensor,
         m: Int32,
         n: Int32,
         k: Int32,
@@ -423,7 +456,7 @@ class GemmSm120:
             tB = None
         if const_expr(self.warp_spec):
             self.kernel_ws(
-                mA, mB, mC, mPre, mSA, mSB, mWs, mFlags, m, n, k, atom_a, tA, atom_b, tB
+                mA, mB, mC, mPre, mSA, mSB, mWs, mFlags, mQ, mQS, mASF, m, n, k, atom_a, tA, atom_b, tB
             ).launch(
                 grid=[ctas, 1, 1],
                 block=[self.threads, 1, 1],
@@ -433,7 +466,7 @@ class GemmSm120:
             )
         else:
             self.kernel(
-                mA, mB, mC, mPre, mSA, mSB, mWs, mFlags, m, n, k, atom_a, tA, atom_b, tB
+                mA, mB, mC, mPre, mSA, mSB, mWs, mFlags, mQ, mQS, mASF, m, n, k, atom_a, tA, atom_b, tB
             ).launch(
                 grid=[ctas, 1, 1],
                 block=[self.NUM_THREADS, 1, 1],
@@ -453,6 +486,9 @@ class GemmSm120:
         mSB: cute.Tensor,
         mWs: cute.Tensor,
         mFlags: cute.Tensor,
+        mQ: cute.Tensor,
+        mQS: cute.Tensor,
+        mASF: cute.Tensor,
         m: Int32,
         n: Int32,
         k: Int32,
@@ -468,6 +504,10 @@ class GemmSm120:
             alpha = alpha * Float32(mSB[0])
         gsa = Int64(mSA.iterator.toint())
         gsb = Int64(mSB.iterator.toint())
+        gq = Int64(mQ.iterator.toint())
+        gqs = Int64(mQS.iterator.toint())
+        gasf = Int64(mASF.iterator.toint())
+        sf16 = Int64(16) * Int64(k // 32)  # bytes between the A scales of rows 16 apart
         tidx, _, _ = cute.arch.thread_idx()
         pid, _, _ = cute.arch.block_idx()
         warp = tidx // 32
@@ -489,6 +529,7 @@ class GemmSm120:
         pid_n = (pid % per_group) // size
         m0 = pid_m * self.BM
         n0 = pid_n * self.BN
+        sfp = gasf + Int64(m0 + warp_m * 64 + g + 8 * (t % 2)) * Int64(k // 32)
 
         storage = cutlass.memory.SmemAllocator().allocate(self.shared_storage)
         nk = k // self.BK
@@ -617,7 +658,7 @@ class GemmSm120:
                             fa,
                             fb,
                         )
-                    self._mma_step(kk % 2, fa, fb, acc)
+                    self._mma_step(kk % 2, fa, fb, acc, sfp, sf16, it, kk)
         else:
             if const_expr(self.tma):
                 for it in cutlass.range(nk, unroll=1):
@@ -626,7 +667,9 @@ class GemmSm120:
                     cute.arch.mbarrier_wait(
                         self._full + it % self.stages, (it // self.stages) & 1
                     )
-                    self._compute(it % self.stages, sbase, warp_m, warp_n, lane, acc)
+                    self._compute(
+                        it % self.stages, sbase, warp_m, warp_n, lane, acc, sfp, sf16, it
+                    )
                     self._tma_release(it, lane)
             else:
                 for it in cutlass.range(nk, unroll=1):
@@ -636,9 +679,11 @@ class GemmSm120:
                     if nxt < nk:
                         self._load(nxt, nxt % self.stages, sbase, ga, gb, k, m, n, tidx)
                     cute.arch.cp_async_commit_group()
-                    self._compute(it % self.stages, sbase, warp_m, warp_n, lane, acc)
+                    self._compute(
+                        it % self.stages, sbase, warp_m, warp_n, lane, acc, sfp, sf16, it
+                    )
 
-        self._epilogue(gc, gp, gsa, gsb, n, m0, n0, warp_m, warp_n, g, t, acc, alpha)
+        self._epilogue(gc, gp, gsa, gsb, gq, gqs, n, m0, n0, warp_m, warp_n, g, t, acc, alpha)
 
     @cute.jit
     def _gelu(self, x):
@@ -675,7 +720,9 @@ class GemmSm120:
         return units
 
     @cute.jit
-    def _epilogue(self, gc, gp, gsa, gsb, n, m0, n0, warp_m, warp_n, g, t, acc, alpha):
+    def _epilogue(
+        self, gc, gp, gsa, gsb, gq, gqs, n, m0, n0, warp_m, warp_n, g, t, acc, alpha
+    ):
         upw = self.NT // 4  # 16-byte stores per lane
         for mi in cutlass.range_constexpr(4):
             for r in cutlass.range_constexpr(2):
@@ -684,6 +731,7 @@ class GemmSm120:
                 if const_expr(self.row_scale):
                     ra = alpha * ld_global_nc_f32(gsa + Int64(row) * 4)
                 words = []
+                vals = []
                 for nt in cutlass.range_constexpr(self.NT):
                     col = n0 + warp_n * self.WN + nt * 8 + 2 * t
                     o = (mi * self.NT + nt) * 4 + 2 * r
@@ -710,6 +758,10 @@ class GemmSm120:
                         v0 = v0 * self._dgelu(p0)
                         v1 = v1 * self._dgelu(p1)
                     words.append(pack_half2(v0, v1, self.ty))
+                    vals.append(v0)
+                    vals.append(v1)
+                if const_expr(self.out_mx):
+                    self._store_mx(gq, gqs, n, row, n0 + warp_n * self.WN, t, vals)
                 # transpose within each quad so every lane holds 16 contiguous bytes
                 units = self._quad_transpose(
                     [words[q * upw : (q + 1) * upw] for q in range(4)], t
@@ -724,6 +776,30 @@ class GemmSm120:
                         units[3][w],
                     )
 
+    @cute.jit
+    def _store_mx(self, gq, gqs, n, row, c0, t, vals):
+        # each 32-column block of a row lives in one quad: 4 column tiles x 2 values per lane
+        for blk in cutlass.range_constexpr(self.NT // 4):
+            amax = Int32(0)
+            for x in cutlass.range_constexpr(8):
+                amax = max(amax, abs_bits(vals[blk * 8 + x]))
+            amax = max(amax, cute.arch.shuffle_sync_bfly(amax, offset=1))
+            amax = max(amax, cute.arch.shuffle_sync_bfly(amax, offset=2))
+            byte, inv = mx_scale(amax)
+            units = [
+                [pack_e4m3x2(vals[blk * 8 + 2 * j] * inv, vals[blk * 8 + 2 * j + 1] * inv)]
+                for j in range(4)
+            ]
+            # afterwards lane t holds all 8 bytes of column tile `4 * blk + t`
+            units = self._quad_transpose(units, t)
+            st_global_v2_b32(
+                gq + Int64(row) * Int64(n) + Int64(c0 + (blk * 4 + t) * 8),
+                join_b16(units[0][0], units[1][0]),
+                join_b16(units[2][0], units[3][0]),
+            )
+            if t == 0:
+                st_global_u8(gqs + Int64(row) * Int64(n // 32) + Int64((c0 + blk * 32) // 32), byte)
+
     @cute.kernel
     def kernel_ws(
         self,
@@ -735,6 +811,9 @@ class GemmSm120:
         mSB: cute.Tensor,
         mWs: cute.Tensor,
         mFlags: cute.Tensor,
+        mQ: cute.Tensor,
+        mQS: cute.Tensor,
+        mASF: cute.Tensor,
         m: Int32,
         n: Int32,
         k: Int32,
@@ -750,6 +829,10 @@ class GemmSm120:
             alpha = alpha * Float32(mSB[0])
         gsa = Int64(mSA.iterator.toint())
         gsb = Int64(mSB.iterator.toint())
+        gq = Int64(mQ.iterator.toint())
+        gqs = Int64(mQS.iterator.toint())
+        gasf = Int64(mASF.iterator.toint())
+        sf16 = Int64(16) * Int64(k // 32)  # bytes between the A scales of rows 16 apart
         # warps 0-7 run the MMAs; warp 8 issues TMA and runs ahead across tiles
         tidx, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
@@ -841,12 +924,19 @@ class GemmSm120:
                 pid_m, pid_n = self._tile_coords(tile, npm, npn)
                 j = (tile - bid) // ncta
                 acc.fill(0.0)
-                self._mainloop(j * nk, nk, sbase, warp_m, warp_n, lane, acc, fa, fb)
+                sfp = gasf + Int64(pid_m * self.BM + warp_m * 64 + g + 8 * (t % 2)) * Int64(
+                    k // 32
+                )
+                self._mainloop(
+                    j * nk, nk, sbase, warp_m, warp_n, lane, acc, fa, fb, sfp, sf16, Int32(0)
+                )
                 self._epilogue(
                     gc,
                     gp,
                     gsa,
                     gsb,
+                    gq,
+                    gqs,
                     n,
                     pid_m * self.BM,
                     pid_n * self.BN,
@@ -864,7 +954,12 @@ class GemmSm120:
                 hi = min(s1, sk * nk + nk) - sk * nk
                 pid_m, pid_n = self._tile_coords(dp_end + sk, npm, npn)
                 acc.fill(0.0)
-                self._mainloop(cbase, hi - lo, sbase, warp_m, warp_n, lane, acc, fa, fb)
+                sfp = gasf + Int64(pid_m * self.BM + warp_m * 64 + g + 8 * (t % 2)) * Int64(
+                    k // 32
+                )
+                self._mainloop(
+                    cbase, hi - lo, sbase, warp_m, warp_n, lane, acc, fa, fb, sfp, sf16, lo
+                )
                 cbase = cbase + (hi - lo)
                 if hi < nk:
                     self._sk_publish(gws, gflags, bid, tidx, acc)
@@ -876,6 +971,8 @@ class GemmSm120:
                         gp,
                         gsa,
                         gsb,
+                        gq,
+                        gqs,
                         n,
                         pid_m * self.BM,
                         pid_n * self.BN,
@@ -908,7 +1005,19 @@ class GemmSm120:
 
     @cute.jit
     def _mainloop(
-        self, cbase: Int32, count: Int32, sbase, warp_m, warp_n, lane, acc, fa, fb
+        self,
+        cbase: Int32,
+        count: Int32,
+        sbase,
+        warp_m,
+        warp_n,
+        lane,
+        acc,
+        fa,
+        fb,
+        sfp,
+        sf16,
+        k0: Int32,
     ):
         kk_n = self.KK
         if const_expr(self.frag_pipe):
@@ -951,14 +1060,16 @@ class GemmSm120:
                             fa,
                             fb,
                         )
-                    self._mma_step(kk % 2, fa, fb, acc)
+                    self._mma_step(kk % 2, fa, fb, acc, sfp, sf16, k0 + it, kk)
         else:
             for it in cutlass.range(count, unroll=1):
                 c = cbase + it
                 cute.arch.mbarrier_wait(
                     self._full + c % self.stages, (c // self.stages) & 1
                 )
-                self._compute(c % self.stages, sbase, warp_m, warp_n, lane, acc)
+                self._compute(
+                    c % self.stages, sbase, warp_m, warp_n, lane, acc, sfp, sf16, k0 + it
+                )
                 self._tma_release(c, lane)
 
     @cute.jit

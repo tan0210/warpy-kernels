@@ -554,3 +554,92 @@ def swizzle_offset(row_bytes, row, chunk):
     if row_bytes == 128:  # 128B swizzle
         return row * 128 + (((row & 7) ^ chunk) << 4)
     return row * 64 + ((((row >> 1) & 3) ^ chunk) << 4)  # 64B swizzle
+
+
+@dsl_user_op
+def ld_global_nc_u8(gaddr, *, loc=None, ip=None):
+    return Int32(
+        asm(
+            T.i32(),
+            [Int64(gaddr)],
+            "{\n\t.reg .b16 t;\n\tld.global.nc.u8 t, [$1];\n\tcvt.u32.u16 $0, t;\n\t}",
+            "=r,l",
+            False,
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def st_global_u8(gaddr, val, *, loc=None, ip=None):
+    asm(
+        None,
+        [Int64(gaddr), Int32(val)],
+        "{\n\t.reg .b16 t;\n\tcvt.u16.u32 t, $1;\n\tst.global.u8 [$0], t;\n\t}",
+        "l,r,~{memory}",
+        True,
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
+def st_global_v2_b32(gaddr, w0, w1, *, loc=None, ip=None):
+    asm(
+        None,
+        [Int64(gaddr), Int32(w0), Int32(w1)],
+        "st.global.v2.b32 [$0], {$1, $2};",
+        "l,r,r,~{memory}",
+        True,
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
+def abs_bits(x, *, loc=None, ip=None):
+    # bits of `|x|`, which order like the values themselves
+    code = "{\n\t.reg .b32 r;\n\tmov.b32 r, $1;\n\tand.b32 $0, r, 0x7fffffff;\n\t}"
+    return Int32(asm(T.i32(), [Float32(x)], code, "=r,f", False, loc, ip))
+
+
+@dsl_user_op
+def mx_scale(amax_bits, *, loc=None, ip=None):
+    # ue8m0 byte of the smallest power of two that maps `amax` to at most 448, and its inverse
+    code = (
+        "{\n\t.reg .b32 e;\n\t"
+        "add.u32 e, $2, 0x1fffff;\n\tshr.u32 e, e, 23;\n\tsub.s32 e, e, 8;\n\t"
+        "max.s32 e, e, 0;\n\tmin.s32 e, e, 254;\n\tmov.b32 $0, e;\n\t"
+        "sub.s32 e, 254, e;\n\tmax.s32 e, e, 1;\n\tshl.b32 e, e, 23;\n\tmov.b32 $1, e;\n\t}"
+    )
+    res = asm(
+        llvm.StructType.get_literal([T.i32(), T.f32()]),
+        [Int32(amax_bits)],
+        code,
+        "=r,=f,r",
+        False,
+        loc,
+        ip,
+    )
+    return Int32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)), Float32(
+        llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip)
+    )
+
+
+@dsl_user_op
+def pack_e4m3x2(x0, x1, *, loc=None, ip=None):
+    # two e4m3 values in the low 16 bits, ``x0`` first
+    code = (
+        "{\n\t.reg .b16 p;\n\tcvt.rn.satfinite.e4m3x2.f32 p, $2, $1;\n\t"
+        "cvt.u32.u16 $0, p;\n\t}"
+    )
+    return Int32(asm(T.i32(), [Float32(x0), Float32(x1)], code, "=r,f,f", False, loc, ip))
+
+
+@dsl_user_op
+def join_b16(lo, hi, *, loc=None, ip=None):
+    # low halves of ``lo`` and ``hi`` as one word
+    return Int32(
+        asm(T.i32(), [Int32(lo), Int32(hi)], "prmt.b32 $0, $1, $2, 0x5410;", "=r,r,r", False, loc, ip)
+    )
