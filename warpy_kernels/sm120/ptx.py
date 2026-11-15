@@ -264,6 +264,27 @@ def ld_global_b32(gaddr, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def ld_global_nc_f32(gaddr, *, loc=None, ip=None):
+    return Float32(
+        asm(T.f32(), [Int64(gaddr)], "ld.global.nc.f32 $0, [$1];", "=f,l", False, loc, ip)
+    )
+
+
+@dsl_user_op
+def ld_global_nc_v2_f32(gaddr, *, loc=None, ip=None):
+    res = asm(
+        llvm.StructType.get_literal([T.f32()] * 2),
+        [Int64(gaddr)],
+        "ld.global.nc.v2.f32 {$0, $1}, [$2];",
+        "=f,=f,l",
+        False,
+        loc,
+        ip,
+    )
+    return unpack_struct(res, T.f32(), Float32, 2, loc, ip)
+
+
+@dsl_user_op
 def ld_global_bf16(gaddr, n, *, loc=None, ip=None):
     # `n` (2 or 4) bf16 at `gaddr` as fp32, one vector load
     if n == 4:

@@ -11,6 +11,12 @@ _TYPES = {torch.bfloat16: "bf16", torch.float16: "f16"}
 SUPPORTED = "compute capability 12.0 (SM120)"
 
 
+def _scale_arg(s):
+    s = from_dlpack(s.reshape(-1))
+    # vector scales are read by address, so one compile serves every length
+    return s.mark_layout_dynamic() if s.shape[0] > 1 else s
+
+
 def make_gemm(
     a,
     b,
@@ -35,7 +41,7 @@ def make_gemm(
     b_trans=False,
     accum=False,
 ):
-    """Prepare ``out = op(a) @ op(b).T * scale_a * scale_b`` on SM120.
+    """Prepare ``out = op(a) @ op(b).T * scale_a * scale_b`` on SM120, with vector scales broadcast as ``[M, 1]`` and ``[N]``.
 
     Args:
         a: ``[M, K]`` bf16, fp16 or ``torch.float8_e4m3fn``, contiguous. ``[K, M]`` if ``a_trans``.
@@ -57,8 +63,10 @@ def make_gemm(
             current one. Needs ``warp_spec``.
         setmaxnreg: Whether to use a 128-thread producer group that gives up registers to the eight MMA warps,
             which lets them use up to 240 instead of 168. Needs ``warp_spec``.
-        scale_a: One-element float32 CUDA tensor that scales ``a``. Only used for fp8 inputs, where it defaults to 1.
-        scale_b: As ``scale_a``, for ``b``.
+        scale_a: Float32 CUDA tensor that scales ``a``: one element, or ``M`` elements to scale each output row.
+            A one-element scale is only used for fp8 inputs, where it defaults to 1. Row scales apply to every
+            input dtype, before ``accum`` and ``act``.
+        scale_b: As ``scale_a``, for ``b``, with ``N`` elements to scale each output column.
         out_dtype: Output dtype when ``out`` is ``None`` and the inputs are fp8.
         act: ``"gelu"`` to apply the exact erf GELU to the scaled product before storing it in ``out``, or
             ``"dgelu"`` to multiply the scaled product by the GELU derivative at ``pre`` (the backward of ``"gelu"``).
@@ -140,6 +148,18 @@ def make_gemm(
     ones = torch.ones(1, dtype=torch.float32, device=a.device)
     scale_a = ones if scale_a is None else scale_a
     scale_b = ones if scale_b is None else scale_b
+    for name, s, size in (("scale_a", scale_a, m), ("scale_b", scale_b, n)):
+        if (
+            s.dtype != torch.float32
+            or not s.is_cuda
+            or s.numel() not in (1, size)
+            or (s.numel() > 1 and (not s.is_contiguous() or s.data_ptr() % 8))
+        ):
+            raise ValueError(
+                f"{name} must be a float32 CUDA tensor of 1 or {size} elements, contiguous and 8-byte aligned"
+            )
+    row_scale = scale_a.numel() > 1
+    col_scale = scale_b.numel() > 1
     # fp8 is passed as raw bytes
     raw = (lambda x: x.view(torch.uint8)) if fp8 else (lambda x: x)
     dyn = lambda x: from_dlpack(raw(x), assumed_align=16).mark_layout_dynamic(
@@ -149,8 +169,8 @@ def make_gemm(
     args = ops + [
         flat(out),
         flat(pre_in if pre_in is not None else out),
-        from_dlpack(scale_a.reshape(-1)),
-        from_dlpack(scale_b.reshape(-1)),
+        _scale_arg(scale_a),
+        _scale_arg(scale_b),
         flat(sk_ws),
         flat(sk_flags),
         Int32(m),
@@ -176,6 +196,8 @@ def make_gemm(
         a_trans,
         b_trans,
         accum,
+        row_scale,
+        col_scale,
     )
     kernel = compile_cached(GemmSm120, ctor, (), *args)
 

@@ -12,6 +12,8 @@ from ..sm120.ptx import (
     fence_gpu,
     ld_global_b32,
     ld_global_cg_v4_f32,
+    ld_global_nc_f32,
+    ld_global_nc_v2_f32,
     ldsm_x4,
     ldsm_x4_trans,
     mma_16816,
@@ -51,8 +53,12 @@ class GemmSm120:
         a_trans: bool = False,
         b_trans: bool = False,
         accum: bool = False,
+        row_scale: bool = False,
+        col_scale: bool = False,
     ):
         self.accum = accum
+        self.row_scale = row_scale
+        self.col_scale = col_scale
         assert not ((a_trans or b_trans) and fp8), (
             "transposed operands need 16-bit inputs"
         )
@@ -456,8 +462,12 @@ class GemmSm120:
         tB,
     ):
         alpha = Float32(1.0)
-        if const_expr(self.fp8):
-            alpha = Float32(mSA[0]) * Float32(mSB[0])
+        if const_expr(self.fp8 and not self.row_scale):
+            alpha = alpha * Float32(mSA[0])
+        if const_expr(self.fp8 and not self.col_scale):
+            alpha = alpha * Float32(mSB[0])
+        gsa = Int64(mSA.iterator.toint())
+        gsb = Int64(mSB.iterator.toint())
         tidx, _, _ = cute.arch.thread_idx()
         pid, _, _ = cute.arch.block_idx()
         warp = tidx // 32
@@ -628,7 +638,7 @@ class GemmSm120:
                     cute.arch.cp_async_commit_group()
                     self._compute(it % self.stages, sbase, warp_m, warp_n, lane, acc)
 
-        self._epilogue(gc, gp, n, m0, n0, warp_m, warp_n, g, t, acc, alpha)
+        self._epilogue(gc, gp, gsa, gsb, n, m0, n0, warp_m, warp_n, g, t, acc, alpha)
 
     @cute.jit
     def _gelu(self, x):
@@ -665,18 +675,26 @@ class GemmSm120:
         return units
 
     @cute.jit
-    def _epilogue(self, gc, gp, n, m0, n0, warp_m, warp_n, g, t, acc, alpha):
+    def _epilogue(self, gc, gp, gsa, gsb, n, m0, n0, warp_m, warp_n, g, t, acc, alpha):
         upw = self.NT // 4  # 16-byte stores per lane
         for mi in cutlass.range_constexpr(4):
             for r in cutlass.range_constexpr(2):
                 row = m0 + warp_m * 64 + mi * 16 + g + 8 * r
+                ra = alpha
+                if const_expr(self.row_scale):
+                    ra = alpha * ld_global_nc_f32(gsa + Int64(row) * 4)
                 words = []
                 for nt in cutlass.range_constexpr(self.NT):
                     col = n0 + warp_n * self.WN + nt * 8 + 2 * t
                     o = (mi * self.NT + nt) * 4 + 2 * r
                     off = (Int64(row) * Int64(n) + Int64(col)) * 2
-                    v0 = acc[o] * alpha
-                    v1 = acc[o + 1] * alpha
+                    v0 = acc[o] * ra
+                    v1 = acc[o + 1] * ra
+                    if const_expr(self.col_scale):
+                        # `col` is even, so the pair is one 8-byte load
+                        s0, s1 = ld_global_nc_v2_f32(gsb + Int64(col) * 4)
+                        v0 = v0 * s0
+                        v1 = v1 * s1
                     if const_expr(self.accum):
                         # add the output buffer before the activation
                         c0, c1 = unpack_half2(ld_global_b32(gc + off), self.ty)
@@ -726,8 +744,12 @@ class GemmSm120:
         tB,
     ):
         alpha = Float32(1.0)
-        if const_expr(self.fp8):
-            alpha = Float32(mSA[0]) * Float32(mSB[0])
+        if const_expr(self.fp8 and not self.row_scale):
+            alpha = alpha * Float32(mSA[0])
+        if const_expr(self.fp8 and not self.col_scale):
+            alpha = alpha * Float32(mSB[0])
+        gsa = Int64(mSA.iterator.toint())
+        gsb = Int64(mSB.iterator.toint())
         # warps 0-7 run the MMAs; warp 8 issues TMA and runs ahead across tiles
         tidx, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
@@ -823,6 +845,8 @@ class GemmSm120:
                 self._epilogue(
                     gc,
                     gp,
+                    gsa,
+                    gsb,
                     n,
                     pid_m * self.BM,
                     pid_n * self.BN,
@@ -850,6 +874,8 @@ class GemmSm120:
                     self._epilogue(
                         gc,
                         gp,
+                        gsa,
+                        gsb,
                         n,
                         pid_m * self.BM,
                         pid_n * self.BN,

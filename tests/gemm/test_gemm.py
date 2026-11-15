@@ -64,6 +64,40 @@ def epilogue(ctx, config, shape):
 
 
 @case(
+    "vector_scales",
+    where=lambda dtype, config, shape: config in (FP8_CONFIGS if dtype == "fp8" else CONFIGS),
+    dtype=["fp8", "bf16"],
+    config=sorted({*CONFIGS, *FP8_CONFIGS}),
+    shape=SHAPES,
+)
+def vector_scales(ctx, dtype, config, shape):
+    m, n, k = shape
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    a = torch.randn(m, k, device="cuda", generator=gen)
+    b = torch.randn(n, k, device="cuda", generator=gen)
+    rows = torch.rand(m, device="cuda", generator=gen) * 4 + 0.05
+    cols = torch.rand(n, device="cuda", generator=gen) * 4 + 0.05
+    c0 = torch.randn(m, n, device="cuda", generator=gen).bfloat16()
+    if dtype == "fp8":
+        a, b, cfg = a.to(FP8), b.to(FP8), FP8_CONFIGS[config]
+    else:
+        a, b, cfg = a.bfloat16(), b.bfloat16(), CONFIGS[config]
+    prod = (a.float() @ b.float().T) * rows[:, None] * cols
+    x = prod + c0.float()
+    tol = 1e-2
+    ctx.metric("rows_cols", rel_l2(_mm(a, b, scale_a=rows, scale_b=cols, **cfg).float(), prod), tol)
+    if dtype == "fp8":  # a one-element scale on the other side still applies
+        half = torch.full((1,), 0.5, device="cuda")
+        got = _mm(a, b, scale_a=rows, scale_b=half, **cfg).float()
+        ctx.metric("rows_scalar", rel_l2(got, prod / cols * 0.5), tol)
+    got = _mm(a, b, out=c0.clone(), accum=True, scale_a=rows, scale_b=cols, **cfg).float()
+    ctx.metric("accum", rel_l2(got, x), tol)
+    post, pre = _mm_gelu(a, b, out=c0.clone(), accum=True, scale_a=rows, scale_b=cols, **cfg)
+    ctx.metric("gelu", rel_l2(post.float(), torch.nn.functional.gelu(x)), tol)
+    ctx.metric("pre", rel_l2(pre.float(), x), tol)
+
+
+@case(
     "matches_cublas",
     where=lambda dtype, config, shape: config in (FP8_CONFIGS if dtype == "fp8" else CONFIGS),
     dtype=["fp8", "bf16"],
