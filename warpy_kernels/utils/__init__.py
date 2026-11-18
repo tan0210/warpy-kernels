@@ -4,8 +4,8 @@ import os
 import cuda.bindings.driver as cuda
 import torch
 import torch.nn.functional as F
-from cutlass import cute
-from cutlass.cute.runtime import from_dlpack
+from cutlass import Numeric, cute
+from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 _compile_cache = {}
 
@@ -24,7 +24,8 @@ def compile_cached(cls, ctor_args, shape_key, *args):
 
     Args:
         cls: Kernel class.
-        ctor_args: Constructor arguments. All of them are part of the cache key.
+        ctor_args: Constructor arguments, positional as a sequence or by keyword as a dict. All of them are part
+            of the cache key.
         shape_key: Extra values the compiled kernel depends on, such as problem sizes.
         *args: Arguments the kernel is compiled for.
 
@@ -32,23 +33,119 @@ def compile_cached(cls, ctor_args, shape_key, *args):
         The compiled kernel. Each call launches on PyTorch's current CUDA stream at that moment, so launches
         are ordered with PyTorch's own work and are recorded by CUDA graph capture.
     """
-    key = (cls.__name__, tuple(ctor_args), tuple(shape_key))
+    kw = isinstance(ctor_args, dict)
+    key = (
+        cls.__name__,
+        tuple(sorted(ctor_args.items())) if kw else tuple(ctor_args),
+        tuple(shape_key),
+    )
     if key not in _compile_cache:
-        _compile_cache[key] = cute.compile(cls(*ctor_args), *args, current_stream())
+        obj = cls(**ctor_args) if kw else cls(*ctor_args)
+        _compile_cache[key] = cute.compile(
+            obj,
+            *[a.cute() if isinstance(a, (Arg, Scalar)) else a for a in args],
+            make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
     kernel = _compile_cache[key]
-    return lambda *call_args: kernel(*call_args, current_stream())
+    # TVM-FFI takes torch tensors and launches on PyTorch's current stream
+    return lambda *call_args: kernel(*[_raw(a) for a in call_args])
+
+
+class Arg:
+    """A CUDA tensor argument of a compiled kernel, described for the compiler only when it compiles.
+
+    Args:
+        t: CUDA tensor.
+        align: Assumed byte alignment of the data pointer, or ``None``.
+        dynamic: Whether shapes and strides are runtime values.
+        leading: Index of the stride-1 dimension when ``dynamic``, or ``None`` to detect it.
+    """
+
+    __slots__ = ("align", "dynamic", "leading", "t")
+
+    def __init__(self, t, align=None, dynamic=False, leading=None):
+        self.t = t
+        self.align = align
+        self.dynamic = dynamic
+        self.leading = leading
+
+    def cute(self):
+        """Return the CuTe tensor the kernel is compiled for.
+
+        Returns:
+            The CuTe tensor.
+        """
+        x = from_dlpack(self.t, assumed_align=self.align)
+        if self.dynamic:
+            x = x.mark_layout_dynamic(
+                **({} if self.leading is None else {"leading_dim": self.leading})
+            )
+        return x
+
+
+class Scalar:
+    """A scalar kernel argument, typed for the compiler only when it compiles.
+
+    Args:
+        ty: CuTe numeric type, such as ``Int32``.
+        v: Python value.
+    """
+
+    __slots__ = ("ty", "v")
+
+    def __init__(self, ty, v):
+        self.ty = ty
+        self.v = v
+
+    def cute(self):
+        """Return the typed value the kernel is compiled for.
+
+        Returns:
+            The CuTe scalar.
+        """
+        return self.ty(self.v)
+
+
+_cached = {}
+
+
+def cached_tensor(key, make):
+    """Return a constant tensor made once per ``key``.
+
+    Args:
+        key: Hashable key, which should include the device and shape.
+        make: Function that creates the tensor.
+
+    Returns:
+        The tensor. Callers must not write to it.
+    """
+    t = _cached.get(key)
+    if t is None:
+        t = _cached[key] = make()
+    return t
+
+
+def _raw(a):
+    if isinstance(a, Arg):
+        return a.t
+    if isinstance(a, Scalar):
+        return a.v
+    if isinstance(a, Numeric):
+        return a.value
+    return a
 
 
 def flat(x):
-    """Wrap ``x`` as a flat 16-byte aligned CuTe tensor.
+    """Describe ``x`` as a flat 16-byte aligned kernel argument.
 
     Args:
         x: CUDA tensor.
 
     Returns:
-        The CuTe tensor.
+        The argument.
     """
-    return from_dlpack(x.reshape(-1), assumed_align=16)
+    return Arg(x.reshape(-1), 16, True, 0)
 
 
 def check_descale(x, batch, h_kv, name):
@@ -140,10 +237,12 @@ def _bucket(n):
     return 1 << max(10, (int(n) - 1).bit_length())
 
 
-def tune_key(kind, d, causal, nq, nk, rep):
-    return (
+def tune_key(kind, d, causal, nq, nk, rep, arch=120):
+    # SM120 keys carry no arch suffix, so caches tuned before other archs existed stay valid
+    key = (
         f"{kind}|d={d}|causal={int(causal)}|nq={_bucket(nq)}|nk={_bucket(nk)}|rep={rep}"
     )
+    return key if arch == 120 else f"{key}|sm{arch}"
 
 
 def tune_lookup(key):
@@ -168,7 +267,7 @@ def tune_store(key, cfg):
         pass
 
 
-def autotune(kind, d, causal, nq, nk, rep, candidates, build, iters, verbose):
+def autotune(kind, d, causal, nq, nk, rep, candidates, build, iters, verbose, arch=120):
     best, results = time_candidates(candidates, build, iters, verbose, kind)
-    tune_store(tune_key(kind, d, causal, nq, nk, rep), best)
+    tune_store(tune_key(kind, d, causal, nq, nk, rep, arch), best)
     return best, results

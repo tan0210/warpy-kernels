@@ -11,7 +11,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from warpy_kernels.sm120.ptx import asm, mma_fp8, mma_mxf8, unpack_struct
+from warpy_kernels.ptx import asm, mma_fp8, mma_mxf8, unpack_struct
 
 THREADS = 256
 CHAINS = 8

@@ -31,7 +31,9 @@ def bench_fwd(ctx, d, causal, n, B=1, H=32):
     args = quantize_qkv(*randn_qkv(B, H, H, n, n, d))
     best, results = autotune_attn_fwd(*args, causal=causal, iters=20, verbose=False)
     ms = min(t for _, t in results if not isinstance(t, str))
-    qb, kb, vb = [torch.randn(B, H, n, d, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    qb, kb, vb = [
+        torch.randn(B, H, n, d, device="cuda", dtype=torch.bfloat16) for _ in range(3)
+    ]
     ms_ref = time_launch_ms(lambda: _fa2(qb, kb, vb, causal), 20)
     _record(ctx, flops, ms, ms_ref, best)
 
@@ -55,10 +57,26 @@ def bench_bwd(ctx, d, causal, n, B=1, H=32):
     q8, k8, v8, sq, sk, sv = quantize_qkv(*randn_qkv(B, H, H, n, n, d))
     out, lse, pmax = attn_fwd(q8, k8, v8, sq, sk, sv, causal=causal)
     dout = torch.randn(B, H, n, d, device="cuda", dtype=torch.bfloat16)
-    best, results = autotune_attn_bwd(q8, k8, v8, out, lse, pmax, dout, sq, sk, sv, causal=causal, iters=10,
-                                          verbose=False)
+    best, results = autotune_attn_bwd(
+        q8,
+        k8,
+        v8,
+        out,
+        lse,
+        pmax,
+        dout,
+        sq,
+        sk,
+        sv,
+        causal=causal,
+        iters=10,
+        verbose=False,
+    )
     ms = min(t for _, t in results if not isinstance(t, str))
-    q, k, v = [torch.randn(B, H, n, d, device="cuda", dtype=torch.bfloat16, requires_grad=True) for _ in range(3)]
+    q, k, v = [
+        torch.randn(B, H, n, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        for _ in range(3)
+    ]
     o = _fa2(q, k, v, causal)
     ms_ref = time_launch_ms(lambda: o.backward(dout, retain_graph=True), 10)
     _record(ctx, flops, ms, ms_ref, best)
@@ -70,7 +88,9 @@ def bench_bwd_bf16(ctx, d, causal, n, B=1, H=32):
     q, k, v = [x.to(torch.bfloat16) for x in randn_qkv(B, H, H, n, n, d)]
     out, lse, pmax = attn_fwd(q, k, v, causal=causal)
     dout = torch.randn(B, H, n, d, device="cuda", dtype=torch.bfloat16)
-    best, results = autotune_attn_bwd(q, k, v, out, lse, pmax, dout, causal=causal, iters=10, verbose=False)
+    best, results = autotune_attn_bwd(
+        q, k, v, out, lse, pmax, dout, causal=causal, iters=10, verbose=False
+    )
     ms = min(t for _, t in results if not isinstance(t, str))
     qg, kg, vg = [x.detach().clone().requires_grad_() for x in (q, k, v)]
     o = _fa2(qg, kg, vg, causal)
@@ -87,7 +107,10 @@ def bench_cross(ctx, nq, nk, B=2, H=16, d=128):
     args = quantize_qkv(*randn_qkv(B, H, H, nq, nk, d))
     best, results = autotune_attn_fwd(*args, iters=20, verbose=False)
     ms = min(t for _, t in results if not isinstance(t, str))
-    q, k, v = [torch.randn(B, H, n, d, device="cuda", dtype=torch.bfloat16) for n in (nq, nk, nk)]
+    q, k, v = [
+        torch.randn(B, H, n, d, device="cuda", dtype=torch.bfloat16)
+        for n in (nq, nk, nk)
+    ]
     ms_ref = time_launch_ms(lambda: _fa2(q, k, v, False), 20)
     _record(ctx, flops, ms, ms_ref, best)
 
@@ -106,7 +129,7 @@ def bench_layout(ctx, n, B=2, H=16, d=128):
     launch_view, *_ = make_attn_fwd(qv, kv, vv, sq, sk, sv)
     ms_view = time_launch_ms(launch_view, 50)
     bufs = [torch.empty(x.shape, dtype=x.dtype, device="cuda") for x in (q8, k8, v8)]
-    launch_copy, out, *_ = make_attn_fwd(*bufs, sq, sk, sv) # type: ignore
+    launch_copy, out, *_ = make_attn_fwd(*bufs, sq, sk, sv)  # type: ignore
 
     def with_copies():
         for buf, x in zip(bufs, (qv, kv, vv)):
@@ -115,8 +138,11 @@ def bench_layout(ctx, n, B=2, H=16, d=128):
         out.transpose(1, 2).contiguous()
 
     ms_copy = time_launch_ms(with_copies, 50)
-    for label, ms in (("contiguous [B, H, N, d]", ms_flat), ("[B, N, H, d] view", ms_view),
-                      ("[B, N, H, d] with copies", ms_copy)):
+    for label, ms in (
+        ("contiguous [B, H, N, d]", ms_flat),
+        ("[B, N, H, d] view", ms_view),
+        ("[B, N, H, d] with copies", ms_copy),
+    ):
         ctx.metric(f"tf:{label}", flops / ms / 1e9)
 
 

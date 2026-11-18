@@ -14,6 +14,7 @@ import torch
 import tests
 from tests.fixtures import Ctx
 from tests.registry import BENCHES, CASES, Skip
+from warpy_kernels import device_arch
 
 
 def _matcher(expr):
@@ -39,6 +40,12 @@ def _run(entry):
             status, detail = "FAIL", "\n".join(ctx.failures)
     except Skip as e:
         status, detail = "SKIP", str(e)
+    except NotImplementedError as e:
+        # SM120 supports everything, so a gap there is an error
+        if device_arch() == 120:
+            status, detail = "ERROR", traceback.format_exc()
+        else:
+            status, detail = "SKIP", str(e)
     except Exception:  # noqa: BLE001  # any test error is reported, not raised
         status, detail = "ERROR", traceback.format_exc()
     return ctx, status, detail, time.perf_counter() - start

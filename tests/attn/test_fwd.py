@@ -11,8 +11,12 @@ from tests.fixtures import (
     sink_qkv,
 )
 from tests.registry import case
-from warpy_kernels import attn_fwd
-from warpy_kernels.attn.sm120_attn_fwd import FWD_CANDIDATES_BF16
+from warpy_kernels import attn_fwd, device_arch
+from warpy_kernels.attn.fwd_api import (
+    FWD_CANDIDATES_BF16,
+    FWD_CANDIDATES_BF16_SM89,
+    FWD_CANDIDATES_SM89,
+)
 
 TOL = {"out": 6e-2, "lse": 5e-2}
 
@@ -35,6 +39,11 @@ FWD_CONFIGS = [
     {"tile_local": False},
     {"lpt": True},
 ]
+
+
+def _unique(cands):
+    flat = cands[64] + cands[128]
+    return [c for i, c in enumerate(flat) if c not in flat[:i]]
 
 
 @case("fwd", shape=SHAPES, causal=[False, True])
@@ -78,6 +87,20 @@ def fwd_ws(ctx, shape, causal, fwd_cfg):
     )
 
 
+@case(
+    "fwd_sm89_cfg",
+    where=lambda shape, fwd_cfg, **_: (
+        fwd_cfg in FWD_CANDIDATES_SM89[shape[5]] and device_arch() != 120
+    ),
+    shape=[SHAPES[1], SHAPES[4], SHAPES[5], SHAPES[6]],
+    causal=[False, True],
+    fwd_cfg=_unique(FWD_CANDIDATES_SM89),
+)
+def fwd_sm89_cfg(ctx, shape, causal, fwd_cfg):
+    q, k, v = randn_qkv(*shape)
+    compare(ctx, q, k, v, None, causal, TOL, fwd_cfg=fwd_cfg)
+
+
 @case("sink", gap=[8, 13, 16])
 def sink(ctx, gap):
     q, k, v = sink_qkv(256, 32768, 128, gap)
@@ -102,9 +125,18 @@ def _bf16_compare(ctx, shape, causal, fwd_cfg=None):
     visible = torch.ones(Nq, dtype=torch.bool, device=q.device)
     if causal:
         visible = (torch.arange(Nq, device=q.device) + Nk - Nq) >= 0
-    ctx.metric("out", rel_l2(out[:, :, visible], out_ref[:, :, visible]), BF16_TOL["out"])
-    ctx.metric("lse", (lse[:, :, visible] - lse_ref[:, :, visible]).abs().max().item(), BF16_TOL["lse"])
-    ctx.expect(bool((out[:, :, ~visible] == 0).all()), "rows without a visible key must give O = 0")
+    ctx.metric(
+        "out", rel_l2(out[:, :, visible], out_ref[:, :, visible]), BF16_TOL["out"]
+    )
+    ctx.metric(
+        "lse",
+        (lse[:, :, visible] - lse_ref[:, :, visible]).abs().max().item(),
+        BF16_TOL["lse"],
+    )
+    ctx.expect(
+        bool((out[:, :, ~visible] == 0).all()),
+        "rows without a visible key must give O = 0",
+    )
 
 
 @case("fwd_bf16", shape=SHAPES, causal=[False, True])
@@ -112,12 +144,17 @@ def fwd_bf16(ctx, shape, causal):
     _bf16_compare(ctx, shape, causal)
 
 
+BF16_CANDIDATES = (
+    FWD_CANDIDATES_BF16 if device_arch() == 120 else FWD_CANDIDATES_BF16_SM89
+)
+
+
 @case(
     "fwd_bf16_cfg",
-    where=lambda shape, fwd_cfg, **_: fwd_cfg in FWD_CANDIDATES_BF16[shape[5]],
+    where=lambda shape, fwd_cfg, **_: fwd_cfg in BF16_CANDIDATES[shape[5]],
     shape=[SHAPES[1], SHAPES[4], SHAPES[5], SHAPES[6]],
     causal=[False, True],
-    fwd_cfg=[c for i, c in enumerate(FWD_CANDIDATES_BF16[64]) if c not in FWD_CANDIDATES_BF16[64][:i]],
+    fwd_cfg=_unique(BF16_CANDIDATES),
 )
 def fwd_bf16_cfg(ctx, shape, causal, fwd_cfg):
     _bf16_compare(ctx, shape, causal, fwd_cfg)

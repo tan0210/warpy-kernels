@@ -97,3 +97,18 @@ FP8_CANDIDATES = [
     )
     for smr in ((smr,) if ws else (False,))
 ]
+
+
+def candidates_for(arch, fp8=False):
+    """Return the default autotuning candidates for an architecture.
+
+    Args:
+        arch: Architecture number, such as 86 or 120.
+        fp8: Whether the inputs are ``torch.float8_e4m3fn``.
+
+    Returns:
+        A list of config dicts with the keyword arguments of ``make_gemm``. Below SM90 it leaves out the TMA,
+        ``warp_spec``, ``persistent`` and ``setmaxnreg`` configs.
+    """
+    base = FP8_CANDIDATES if fp8 else CANDIDATES
+    return list(base) if arch >= 90 else [c for c in base if not c.get("tma")]
