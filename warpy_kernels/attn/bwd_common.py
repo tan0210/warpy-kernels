@@ -7,9 +7,11 @@ from cutlass import Float32, Int32, Int64, const_expr, cute
 from ..ptx import (
     ds_scale,
     e4m3x4_to_f32,
+    ld_fixed2_f32,
     ld_global_bf16,
     pack_e4m3x4,
     pack_half2,
+    pow2_inv,
     red_max_pos_f32,
     st_global_b16,
     st_global_b32,
@@ -21,11 +23,19 @@ from .constants import LOG2E, P_OFFSET
 class BwdPrep:
     ROWS_PER_CTA = 8
 
-    def __init__(self, head_dim: int, zero_dq: bool = True, bf16: bool = False):
+    def __init__(
+        self,
+        head_dim: int,
+        zero_dq: bool = True,
+        bf16: bool = False,
+        fixed_dq: bool = False,
+    ):
         self.d = head_dim
         self.per_lane = head_dim // 32
         self.zero_dq = zero_dq
         self.bf16 = bf16
+        # dQ adds as int32 pairs, with each query's fixed-point scale next to its dS scale
+        self.fixed_dq = fixed_dq
 
     def _row_coords(self, row, nq, h_q, h_kv):
         b = row // (h_q * nq)
@@ -239,7 +249,35 @@ class BwdPrep:
                         * mStats[b, hkv, 2]
                     )
                     # per-query dS scale of the dQ product
-                    mG[prow] = ds_scale(rb)
+                    gq = ds_scale(rb)
+                    if const_expr(self.fixed_dq):
+                        gi = g_index(prow)
+                        mG[gi] = gq
+                        # `sum |dS| * max |K|` bounds every partial dQ sum, so `fq` keeps them within 2^30
+                        bound = (
+                            Float32(2.0)
+                            * cute.math.sqrt(nsum, fastmath=True)
+                            * mStats[b, hkv, 2]
+                            * mStats[b, hkv, 1]
+                        )
+                        fq = ds_scale(bound) * Float32(2.0**22)
+                        mG[gi + 128] = fq * pow2_inv(gq)
+                    else:
+                        mG[prow] = gq
+
+
+def g_index(prow):
+    """Return where query row ``prow`` keeps its dS scale when dQ adds in fixed point.
+
+    Rows come in blocks of 128 dS scales followed by 128 fixed-point scales.
+
+    Args:
+        prow: Padded query row, ``(b * Hq + h) * nq_pad + i``.
+
+    Returns:
+        The index into the scale array.
+    """
+    return (prow // 128) * 256 + prow % 128
 
 
 @cute.jit
@@ -363,3 +401,84 @@ class BwdDqPost:
                     gout + (Int64((b * h_q + hq) * seqlen_q + qg) * d + Int64(col)) * 2
                 )
                 st_global_b32(addr, pack_half2(x0 * s_dq, x1 * s_dq, "bf16"))
+
+
+class BwdDqPostFixed(BwdDqPost):
+    """Converts a fixed-point dQ accumulator, added as int32 pairs, to bf16."""
+
+    def __init__(self, head_dim: int, block_m: int, staged: bool = False):
+        super().__init__(head_dim, block_m, staged)
+
+    @cute.jit
+    def __call__(
+        self,
+        mAcc: cute.Tensor,
+        mG: cute.Tensor,
+        mStats: cute.Tensor,
+        mDesc: cute.Tensor,
+        mdQ: cute.Tensor,
+        softmax_scale: Float32,
+        seqlen_q: Int32,
+        nq_pad: Int32,
+        h_q: Int32,
+        h_kv: Int32,
+        batch: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel_fixed(
+            mAcc, mG, mStats, mDesc, mdQ, softmax_scale, seqlen_q, nq_pad, h_q, h_kv
+        ).launch(
+            grid=[nq_pad // self.BM, h_q, batch],
+            block=[self.NUM_THREADS, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel_fixed(
+        self,
+        mAcc: cute.Tensor,
+        mG: cute.Tensor,
+        mStats: cute.Tensor,
+        mDesc: cute.Tensor,
+        mdQ: cute.Tensor,
+        softmax_scale: Float32,
+        seqlen_q: Int32,
+        nq_pad: Int32,
+        h_q: Int32,
+        h_kv: Int32,
+    ):
+        d = self.d
+        tidx, _, _ = cute.arch.thread_idx()
+        tile, hq, b = cute.arch.block_idx()
+        hkv = hq // (h_q // h_kv)
+        _, _, _, _, s_dq = bwd_scales(mStats, mDesc, b, hkv, softmax_scale)
+        row_base = (b * h_q + hq) * nq_pad + tile * self.BM
+        gacc = Int64(mAcc.iterator.toint())
+        gout = Int64(mdQ.iterator.toint())
+        dchunks = d // 16
+        for k in cutlass.range_constexpr(self.pairs_per_thread):
+            p = tidx + self.NUM_THREADS * k
+            q_loc = p // (d // 2)
+            col = (p % (d // 2)) * 2
+            prow = row_base + q_loc
+            gi = g_index(prow)
+            # the accumulator holds `dQ * fq`, and `fq = cq * gq`
+            inv = pow2_inv(mG[gi + 128] * mG[gi]) * s_dq
+            idx = Int64(prow) * d + Int64(col)
+            if const_expr(self.staged):
+                # inverse of the fragment order `AttnBwdSm120` stages for its bulk adds
+                blk = (q_loc // 16) * dchunks + col // 16
+                warp = blk % self.num_warps
+                i = blk // self.num_warps
+                h = (col % 16) // 8
+                r = (q_loc % 16) // 8
+                lane = (q_loc % 8) * 4 + (col % 8) // 2
+                slot = (((warp * self.nb + i) * 2 + h) * 2 + r) * 32 + lane
+                idx = Int64(row_base) * d + Int64(2 * slot)
+            x = ld_fixed2_f32(gacc + idx * 4)
+            qg = tile * self.BM + q_loc
+            if qg < seqlen_q:
+                addr = (
+                    gout + (Int64((b * h_q + hq) * seqlen_q + qg) * d + Int64(col)) * 2
+                )
+                st_global_b32(addr, pack_half2(x[0] * inv, x[1] * inv, "bf16"))

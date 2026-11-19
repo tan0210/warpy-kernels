@@ -111,10 +111,19 @@ FWD_DEFAULTS_BF16_SM89 = {
 }
 
 
-def _defaults(arch, bf16):
+# causal e4m3 d64 on SM89, 16-18% faster than the d64 default on an RTX 4070 Ti SUPER at n = 1024 to 8192
+FWD_DEFAULTS_CAUSAL_SM89 = {
+    **FWD_DEFAULTS_SM89,
+    64: {"block_m": 64, "pipelined": False, "num_stages": 2, "block_n": 128},
+}
+
+
+def _defaults(arch, bf16, causal=False):
     if bf16:
         return FWD_DEFAULTS_BF16_SM89 if arch != 120 else FWD_DEFAULTS_BF16
-    return FWD_DEFAULTS_SM89 if arch != 120 else FWD_DEFAULTS
+    if arch == 120:
+        return FWD_DEFAULTS
+    return FWD_DEFAULTS_CAUSAL_SM89 if causal else FWD_DEFAULTS_SM89
 
 
 def _kernel_view(x, n_pad):
@@ -259,7 +268,7 @@ def make_attn_fwd(
                     "fwd_bf16" if bf16 else "fwd", d, causal, Nq, Nk, Hq // Hkv, arch
                 )
             )
-            or _defaults(arch, bf16)[d]
+            or _defaults(arch, bf16, causal)[d]
         )
         num_stages = tuned["num_stages"] if num_stages is None else num_stages
         pipelined = tuned["pipelined"] if pipelined is None else pipelined
@@ -275,7 +284,7 @@ def make_attn_fwd(
         )
     tuned_cfg = (
         tune_lookup(tune_key("fwd_bf16" if bf16 else "fwd", d, causal, Nq, Nk, Hq // Hkv, arch))
-        or _defaults(arch, bf16)[d]
+        or _defaults(arch, bf16, causal)[d]
     )
 
     def tuned_get(key):

@@ -44,10 +44,14 @@ class AttnBwdSm80:
         arch: int = 80,
         dq_interleave: bool = False,
         bf16: bool = True,
+        one_barrier: bool = False,
     ):
         assert bf16 or self.FP8, f"{type(self).__name__} needs bf16 inputs"
         assert head_dim in (64, 128) and block_m in ((16, 32, 64) if bf16 else (32, 64))
         assert num_stages >= 2, "the Q/dO pipeline needs at least 2 stages"
+        assert not one_barrier or (num_stages >= 3 and not skip_dq), (
+            "one barrier per tile needs 3 stages and the dQ pass"
+        )
         blocks = (block_m // 16) * (head_dim // 16)
         assert blocks % self.WARPS == 0, (
             "dQ needs a whole number of m16 x 16-column blocks per warp"
@@ -63,6 +67,8 @@ class AttnBwdSm80:
         self.skip_dq = skip_dq
         self.kb_major = kb_major
         self.dq_interleave = dq_interleave
+        # one barrier per tile, with dS double-buffered so the next tile can write it early
+        self.one_barrier = one_barrier
         self.bf16 = bf16
         # bf16 P needs no offset against underflow
         self.p_off = 0.0 if bf16 else P_OFFSET
@@ -84,7 +90,8 @@ class AttnBwdSm80:
         self.ds_off = self.ld_off + num_stages * self.ld_stage_bytes
         # bf16 dS^T as `[key][query]`, e4m3 dS as `[query][key]`
         self.ds_shape = (block_m * 2, self.BC) if bf16 else (self.BC, block_m)
-        self.smem_bytes = self.ds_off + self.ds_shape[1] * (self.ds_shape[0] + 16)
+        self.ds_bytes = self.ds_shape[1] * (self.ds_shape[0] + 16)
+        self.smem_bytes = self.ds_off + self.ds_bytes * (2 if one_barrier else 1)
         assert self.smem_bytes <= smem_limit(arch), (
             f"shared memory does not fit: {self.smem_bytes} B > {smem_limit(arch)} B "
             f"(d={head_dim}, block_m={block_m}, num_stages={num_stages})"
@@ -96,6 +103,9 @@ class AttnBwdSm80:
             buf: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, nbytes], 1024]
 
         self.shared_storage = SharedStorage
+
+    def _g_row(self, row0):
+        return row0  # where the dQ scales of rows `row0 ..` start
 
     def _tile(self, sbase, off, rows):
         return SmemTile(sbase + off, self.row_bytes, rows)
@@ -160,8 +170,9 @@ class AttnBwdSm80:
             pieces = self.BM // 4
             if tidx < (2 if self.bf16 else 3) * pieces:
                 which = tidx // pieces
+                r0 = Int64(row0) if which < 2 else Int64(self._g_row(row0))
                 gsrc = (gl if which == 0 else (gd if which == 1 else self._gg)) + (
-                    Int64(row0) + Int64(4 * (tidx % pieces))
+                    r0 + Int64(4 * (tidx % pieces))
                 ) * 4
                 cp_async16(
                     sbase
@@ -548,42 +559,87 @@ class AttnBwdSm80:
                 for x in cutlass.range_constexpr(4):
                     vf[4 * kk + x] = a_v[x]
 
-        for it in cutlass.range(total_it, unroll=1):
-            cute.arch.cp_async_wait_group(self.stages - 2)  # tile `it` resident
-            cute.arch.sync_threads()  # and every warp is done with tile `it - 1` and its dS
-            self._load_q(
-                it + (self.stages - 1), total_it, tile, sbase, gq, gdo, gl, gd, tidx
-            )
-            cute.arch.cp_async_commit_group()
-            st = it % self.stages
-            row0, _, qi = self._q_row0(it, tile)
-            self._mma_sdp(sbase, st, warp, lane, vf, s_acc, dp_acc)
-            self._softmax_ds(
-                sbase,
-                st,
-                qi,
-                kblock,
-                seqlen_q,
-                seqlen_k,
-                warp,
-                lane,
-                beta,
-                kc,
-                s_acc,
-                dp_acc,
-            )
-            if const_expr(not self.skip_dq):
-                self._store_ds(sbase, st, ds, warp, lane, dp_acc)
-            if const_expr(self.skip_dq):
-                self._mma_dvdk(sbase, st, lane, s_acc, dp_acc, dv_acc, dk_acc)
-            elif const_expr(self.dq_interleave):
-                cute.arch.sync_threads()  # all of dS is written
-                parts = self._dq(sbase, st, ds, row0, gdq, warp, lane)
-                self._mma_dvdk(sbase, st, lane, s_acc, dp_acc, dv_acc, dk_acc, parts)
-            else:
-                self._mma_dvdk(sbase, st, lane, s_acc, dp_acc, dv_acc, dk_acc)
-                cute.arch.sync_threads()  # all of dS is written
-                self._red_dq(self._dq(sbase, st, ds, row0, gdq, warp, lane))
+        if const_expr(self.one_barrier):
+            cute.arch.cp_async_wait_group(self.stages - 2)  # K, V and tile 0 resident
+            cute.arch.sync_threads()
+            for it in cutlass.range(total_it, unroll=1):
+                st = it % self.stages
+                row0, _, qi = self._q_row0(it, tile)
+                dsb = PaddedTile(
+                    sbase + self.ds_off + (it % 2) * self.ds_bytes, *self.ds_shape
+                )
+                self._mma_sdp(sbase, st, warp, lane, vf, s_acc, dp_acc)
+                self._softmax_ds(
+                    sbase,
+                    st,
+                    qi,
+                    kblock,
+                    seqlen_q,
+                    seqlen_k,
+                    warp,
+                    lane,
+                    beta,
+                    kc,
+                    s_acc,
+                    dp_acc,
+                )
+                self._store_ds(sbase, st, dsb, warp, lane, dp_acc)
+                if const_expr(not self.dq_interleave):
+                    self._mma_dvdk(sbase, st, lane, s_acc, dp_acc, dv_acc, dk_acc)
+                cute.arch.cp_async_wait_group(self.stages - 3)  # tile `it + 1` resident
+                # dS is written, and every warp is done with tile `it - 1`, whose slot the next load reuses
+                cute.arch.sync_threads()
+                self._load_q(
+                    it + (self.stages - 1), total_it, tile, sbase, gq, gdo, gl, gd, tidx
+                )
+                cute.arch.cp_async_commit_group()
+                if const_expr(self.dq_interleave):
+                    parts = self._dq(sbase, st, dsb, row0, gdq, warp, lane)
+                    self._mma_dvdk(
+                        sbase, st, lane, s_acc, dp_acc, dv_acc, dk_acc, parts
+                    )
+                else:
+                    self._red_dq(self._dq(sbase, st, dsb, row0, gdq, warp, lane))
+
+        else:
+            for it in cutlass.range(total_it, unroll=1):
+                cute.arch.cp_async_wait_group(self.stages - 2)  # tile `it` resident
+                cute.arch.sync_threads()  # and every warp is done with tile `it - 1` and its dS
+                self._load_q(
+                    it + (self.stages - 1), total_it, tile, sbase, gq, gdo, gl, gd, tidx
+                )
+                cute.arch.cp_async_commit_group()
+                st = it % self.stages
+                row0, _, qi = self._q_row0(it, tile)
+                self._mma_sdp(sbase, st, warp, lane, vf, s_acc, dp_acc)
+                self._softmax_ds(
+                    sbase,
+                    st,
+                    qi,
+                    kblock,
+                    seqlen_q,
+                    seqlen_k,
+                    warp,
+                    lane,
+                    beta,
+                    kc,
+                    s_acc,
+                    dp_acc,
+                )
+                if const_expr(not self.skip_dq):
+                    self._store_ds(sbase, st, ds, warp, lane, dp_acc)
+                if const_expr(self.skip_dq):
+                    self._mma_dvdk(sbase, st, lane, s_acc, dp_acc, dv_acc, dk_acc)
+                elif const_expr(self.dq_interleave):
+                    cute.arch.sync_threads()  # all of dS is written
+                    parts = self._dq(sbase, st, ds, row0, gdq, warp, lane)
+                    self._mma_dvdk(
+                        sbase, st, lane, s_acc, dp_acc, dv_acc, dk_acc, parts
+                    )
+                else:
+                    self._mma_dvdk(sbase, st, lane, s_acc, dp_acc, dv_acc, dk_acc)
+                    cute.arch.sync_threads()  # all of dS is written
+                    self._red_dq(self._dq(sbase, st, ds, row0, gdq, warp, lane))
 
         self._store_dkdv(
             warp, lane, kblock, seqlen_k, s_dk, s_dv, k_row0, dk_acc, dv_acc, mdK, mdV

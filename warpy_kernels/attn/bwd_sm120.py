@@ -8,8 +8,10 @@ from cutlass import Float32, Int32, Int64, const_expr, cute
 from ..arch import smem_limit
 from ..ptx import (
     bulk_reduce_add_f32,
+    bulk_reduce_add_u64,
     cp_async16,
     ds_scale,
+    ld_shared_f32,
     ld_shared_v2_f32,
     ldsm_x2_trans_b8,
     ldsm_x4,
@@ -17,16 +19,19 @@ from ..ptx import (
     mma_16816,
     mma_mxf8,
     pack_e4m3x4,
+    pack_fixed2,
     pack_half2,
+    red_add_u64,
     red_add_v2_f32,
     st_global_b32,
+    st_shared_b64,
     st_shared_e4m3_pair,
     st_shared_v2_f32,
     stsm_x4_trans,
     swizzle_offset,
     ue8m0_inv,
 )
-from .bwd_common import bwd_scales
+from .bwd_common import bwd_scales, g_index
 from .constants import P_OFFSET
 
 
@@ -49,8 +54,12 @@ class AttnBwdSm120:
         dq_bulk: bool = True,
         kb_major: bool = False,
         bf16: bool = False,
+        fixed_dq: bool = False,
     ):
         assert head_dim in (64, 128) and block_m in ((16, 32, 64) if bf16 else (32, 64))
+        assert not (fixed_dq and bf16), "fixed-point dQ needs the e4m3 dQ scales"
+        # dQ adds as int32 pairs, which makes it bitwise reproducible
+        self.fixed_dq = fixed_dq
         assert num_stages >= 2, "the Q/dO pipeline needs at least 2 stages"
         self.bf16 = bf16
         # bf16 P needs no offset against underflow
@@ -85,8 +94,8 @@ class AttnBwdSm120:
         self.dolo_off = self.do_off + num_stages * self.q_tile_bytes
         self.ds_off = self.dolo_off + (0 if bf16 else num_stages * self.q_tile_bytes)
         self.dq_stage_bytes = block_m * head_dim * 4
-        # `L`, `D` and the per-query dQ scale (fp32) for one query tile
-        self.ld_stage_bytes = 3 * block_m * 4
+        # `L`, `D`, the per-query dQ scale and with fixed-point dQ its scale `cq` (fp32) for one query tile
+        self.ld_stage_bytes = (4 if fixed_dq else 3) * block_m * 4
         self.ld_off = self.ds_off + 2 * self.ds_bytes
         self.dq_off = self.ld_off + num_stages * self.ld_stage_bytes
         self.smem_bytes = self.dq_off + (self.dq_stage_bytes if self.dq_bulk else 0)
@@ -103,6 +112,12 @@ class AttnBwdSm120:
             buf: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, nbytes], 1024]
 
         self.shared_storage = SharedStorage
+
+    def _bulk_add(self, gaddr, saddr, nbytes):
+        if const_expr(self.fixed_dq):
+            bulk_reduce_add_u64(gaddr, saddr, nbytes)
+        else:
+            bulk_reduce_add_f32(gaddr, saddr, nbytes)
 
     def _swz_off(self, row, chunk):
         if self.bf16:
@@ -200,10 +215,17 @@ class AttnBwdSm120:
                 )
             # L, D and the e4m3 dQ scale rows in 16-byte pieces
             pieces = self.BM // 4
-            if tidx < (2 if self.bf16 else 3) * pieces:
+            if tidx < (2 if self.bf16 else (4 if self.fixed_dq else 3)) * pieces:
                 which = tidx // pieces
+                r0 = Int64(row0)
+                if const_expr(self.fixed_dq):
+                    r0 = (
+                        Int64(row0)
+                        if which < 2
+                        else Int64(g_index(row0) + (which - 2) * 128)
+                    )
                 gsrc = (gl if which == 0 else (gd if which == 1 else self._gg)) + (
-                    Int64(row0) + Int64(4 * (tidx % pieces))
+                    r0 + Int64(4 * (tidx % pieces))
                 ) * 4
                 cp_async16(
                     sbase
@@ -717,7 +739,22 @@ class AttnBwdSm120:
             for h in cutlass.range_constexpr(2):
                 for r in cutlass.range_constexpr(2):
                     o = 8 * i + 4 * h + 2 * r
-                    if const_expr(self.dq_bulk):
+                    if const_expr(self.fixed_dq):
+                        q_loc = mts[i] * 16 + g + 8 * r
+                        # `fq = cq * gq` puts this tile's dQ in fixed point
+                        fq = ld_shared_f32(
+                            gq_base + (self.BM + q_loc) * 4
+                        ) * ld_shared_f32(gq_base + q_loc * 4)
+                        v = pack_fixed2(dq_acc[o] * fq, dq_acc[o + 1] * fq)
+                        if const_expr(self.dq_bulk):
+                            slot = (((warp * self.nb + i) * 2 + h) * 2 + r) * 32 + lane
+                            st_shared_b64(sdq + slot * 8, v)
+                        else:
+                            col = (warp + chs[i]) * 16 + 8 * h + 2 * t
+                            red_add_u64(
+                                gdq + (Int64(row0 + q_loc) * d + Int64(col)) * 4, v
+                            )
+                    elif const_expr(self.dq_bulk):
                         # conflict-free fragment order, undone by `BwdDqPost`
                         slot = (((warp * self.nb + i) * 2 + h) * 2 + r) * 32 + lane
                         st_shared_v2_f32(sdq + slot * 8, dq_acc[o], dq_acc[o + 1])
@@ -891,7 +928,7 @@ class AttnBwdSm120:
                         prow0, _ = self._q_row0(
                             it - 1, n_q, q_start, b, hkv, h_q, h_kv, nq_pad
                         )
-                        bulk_reduce_add_f32(
+                        self._bulk_add(
                             gdq + Int64(prow0) * (d * 4),
                             sbase + self.dq_off,
                             self.dq_stage_bytes,
@@ -922,7 +959,7 @@ class AttnBwdSm120:
                     lrow0, _ = self._q_row0(
                         total_it - 1, n_q, q_start, b, hkv, h_q, h_kv, nq_pad
                     )
-                    bulk_reduce_add_f32(
+                    self._bulk_add(
                         gdq + Int64(lrow0) * (d * 4),
                         sbase + self.dq_off,
                         self.dq_stage_bytes,

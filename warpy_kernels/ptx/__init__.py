@@ -9,6 +9,7 @@ from .common import (
     ds_scale,
     fence_gpu,
     join_b16,
+    ld_fixed2_f32,
     ld_global_b32,
     ld_global_bf16,
     ld_global_cg_v2_f32,
@@ -22,10 +23,12 @@ from .common import (
     ldsm_x4_trans,
     mma_16816,
     mx_scale,
+    pack_fixed2,
     pack_half2,
     pow2_inv,
     prmt,
     red_add_f32,
+    red_add_u64,
     red_max_pos_f32,
     st_global_b16,
     st_global_b32,
@@ -37,6 +40,7 @@ from .common import (
     st_global_zero,
     st_release_gpu_b32,
     st_shared_b32,
+    st_shared_b64,
     st_shared_v2_f32,
     ue8m0_inv,
     unpack_half2,
@@ -46,7 +50,12 @@ from .common import (
     warp_sync,
 )
 from .sm89 import e4m3x4_to_f32, mma_fp8, pack_e4m3x2, pack_e4m3x4, st_shared_e4m3_pair
-from .sm90 import bulk_reduce_add_f32, red_add_v2_f32, stsm_x4_trans
+from .sm90 import (
+    bulk_reduce_add_f32,
+    bulk_reduce_add_u64,
+    red_add_v2_f32,
+    stsm_x4_trans,
+)
 from .sm120 import ldsm_x2_trans_b8, mma_mxf8
 
 __all__ = [
@@ -55,12 +64,14 @@ __all__ = [
     "abs_bits",
     "asm",
     "bulk_reduce_add_f32",
+    "bulk_reduce_add_u64",
     "cp_async16",
     "div_rn",
     "ds_scale",
     "e4m3x4_to_f32",
     "fence_gpu",
     "join_b16",
+    "ld_fixed2_f32",
     "ld_global_b32",
     "ld_global_bf16",
     "ld_global_cg_v2_f32",
@@ -79,10 +90,12 @@ __all__ = [
     "mx_scale",
     "pack_e4m3x2",
     "pack_e4m3x4",
+    "pack_fixed2",
     "pack_half2",
     "pow2_inv",
     "prmt",
     "red_add_f32",
+    "red_add_u64",
     "red_add_v2_f32",
     "red_max_pos_f32",
     "st_global_b16",
@@ -95,6 +108,7 @@ __all__ = [
     "st_global_zero",
     "st_release_gpu_b32",
     "st_shared_b32",
+    "st_shared_b64",
     "st_shared_e4m3_pair",
     "st_shared_v2_f32",
     "stsm_x4_trans",

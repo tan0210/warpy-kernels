@@ -17,7 +17,7 @@ from ..utils import (
     tune_key,
     tune_lookup,
 )
-from .bwd_common import BwdDqPost, BwdPrep
+from .bwd_common import BwdDqPost, BwdDqPostFixed, BwdPrep
 from .bwd_sm80 import AttnBwdSm80
 from .bwd_sm89 import AttnBwdSm89
 from .bwd_sm120 import AttnBwdDqSm120, AttnBwdSm120
@@ -43,6 +43,7 @@ def make_attn_bwd(
     block_m=None,
     kb_major=None,
     seqused_k=None,
+    one_barrier=None,
 ):
     """Prepare the attention backward.
 
@@ -68,8 +69,11 @@ def make_attn_bwd(
             ``None`` takes the autotuned or built-in choice. Ignored below SM120.
         dq_interleave: Whether to issue the dQ atomics between the dV and dK matrix multiplies instead of after
             them. ``None`` takes the autotuned or built-in choice. Ignored on SM120.
-        deterministic: Whether to compute dQ in a separate kernel without atomics. This is bitwise
-            reproducible but recomputes S and dP. SM120 only.
+        one_barrier: Whether to synchronize once per query tile instead of twice, at the cost of a second dS
+            buffer. Needs 3 or more stages. ``None`` takes the autotuned or built-in choice. Ignored on SM120.
+        deterministic: Whether the gradients must be bitwise reproducible. e4m3 inputs then add dQ in fixed
+            point, which SM89 always does. bf16 inputs on SM120 compute dQ in a separate kernel that recomputes
+            S and dP. Not supported for bf16 below SM120.
         block_m: Queries per inner iteration: 32 or 64 for e4m3 inputs, 16, 32 or 64 for bf16. ``None`` takes the
             autotuned or built-in choice.
         kb_major: Whether to launch key blocks slowest, so the longest causal CTAs go first. Defaults to
@@ -82,7 +86,7 @@ def make_attn_bwd(
         returns ``(dq, dk, dv)`` in bf16: gradients with respect to the dequantized ``q``, ``k`` and ``v``.
 
     Raises:
-        NotImplementedError: If ``seqused_k`` is given, ``deterministic`` is set below SM120, or the GPU does not
+        NotImplementedError: If ``seqused_k`` is given, ``deterministic`` is set for bf16 below SM120, or the GPU does not
             support the dtype of ``q``. See
             ``warpy_kernels.supports``.
         ValueError: If a tensor has the wrong dtype or shape, or a descale is not ``[B, Hkv]`` or is given for
@@ -147,6 +151,7 @@ def make_attn_bwd(
         or dq_bulk is None
         or dq_interleave is None
         or block_m is None
+        or one_barrier is None
     ):
         tuned = (
             tune_lookup(
@@ -154,7 +159,7 @@ def make_attn_bwd(
                     "bwd_bf16" if bf16 else "bwd", d, causal, Nq, Nk, Hq // Hkv, arch
                 )
             )
-            or _defaults(arch, bf16)[d]
+            or _defaults(arch, bf16, causal)[d]
         )
         num_stages = tuned["num_stages"] if num_stages is None else num_stages
         dq_bulk = tuned.get("dq_bulk", False) if dq_bulk is None else dq_bulk
@@ -164,10 +169,17 @@ def make_attn_bwd(
             else dq_interleave
         )
         block_m = tuned["block_m"] if block_m is None else block_m
-    if deterministic and arch != 120:
+        one_barrier = (
+            tuned.get("one_barrier", False) if one_barrier is None else one_barrier
+        )
+    if deterministic and arch != 120 and not (arch == 89 and not bf16):
         raise NotImplementedError(
             f"deterministic attention backward is not supported on SM{arch}"
+            + (" with bf16 inputs" if arch == 89 else "")
         )
+    # e4m3 dQ added as integers is reproducible without the separate dQ kernel, which only bf16 on SM120 needs
+    fixed_dq = not bf16 and (arch == 89 or deterministic)
+    deterministic = deterministic and bf16 and arch == 120
     if deterministic or arch != 120:
         dq_bulk = False
     nq_pad = round_up(Nq, 128)
@@ -192,9 +204,11 @@ def make_attn_bwd(
         do8 = (torch.zeros if nq_pad != Nq else torch.empty)(
             B, Hq, nq_pad, d, dtype=torch.uint8, device=dev
         )
-        # dO's residual term and the per-query dQ scales
+        # dO's residual term and the per-query dQ scales, plus fixed-point scales where dQ adds as integers
         do8lo = torch.zeros_like(do8)
-        gq = torch.zeros(B, Hq, nq_pad, dtype=torch.float32, device=dev)
+        gq = torch.zeros(
+            B * Hq * nq_pad * (2 if fixed_dq else 1), dtype=torch.float32, device=dev
+        )
     # [dO amax, unused, max |V|, unused] per (batch, kv head)
     stats_buf = torch.zeros(B * Hkv * 4, dtype=torch.float32, device=dev)
     stats = stats_buf.view(B, Hkv, 4)
@@ -203,6 +217,8 @@ def make_attn_bwd(
         stats_init.view(B, Hkv, 4)[:, :, 2] = (
             (v.float() * sv[:, :, None, None]).norm(dim=-1).amax(dim=2)
         )
+    if fixed_dq:
+        stats_init.view(B, Hkv, 4)[:, :, 1] = k.float().abs().amax(dim=(2, 3))
     dk_out = torch.empty(B, Hkv, nk_pad, d, dtype=torch.bfloat16, device=dev)
     dv_out = torch.empty(B, Hkv, nk_pad, d, dtype=torch.bfloat16, device=dev)
 
@@ -230,7 +246,7 @@ def make_attn_bwd(
     ]
     prep = compile_cached(
         BwdPrep,
-        (d, dq_acc is not None, bf16),
+        (d, dq_acc is not None, bf16) + ((True,) if fixed_dq else ()),
         (str(dout_c.dtype), B, Hq, Hkv, Nq, nq_pad),
         *prep_args,
     )
@@ -278,12 +294,21 @@ def make_attn_bwd(
             Int32(Hkv),
             Int32(B),
         ]
-        post = compile_cached(
-            BwdDqPost,
-            (d, block_m, dq_bulk),
-            (B, Hq, Hkv, Nq, nq_pad),
-            *post_args,
-        )
+        if fixed_dq:
+            post_args.insert(1, flat(gq))
+            post = compile_cached(
+                BwdDqPostFixed,
+                (d, block_m, dq_bulk),
+                (B, Hq, Hkv, Nq, nq_pad),
+                *post_args,
+            )
+        else:
+            post = compile_cached(
+                BwdDqPost,
+                (d, block_m, dq_bulk),
+                (B, Hq, Hkv, Nq, nq_pad),
+                *post_args,
+            )
 
     scalars = [
         Float32(softmax_scale),
@@ -314,7 +339,8 @@ def make_attn_bwd(
         ]
         main = compile_cached(
             AttnBwdSm120,
-            (d, causal, block_m, num_stages, not run_main_dq, dq_bulk, kb_major, bf16),
+            (d, causal, block_m, num_stages, not run_main_dq, dq_bulk, kb_major, bf16)
+            + ((True,) if fixed_dq else ()),
             (B, Hq, Hkv, nq_pad, nk_pad),
             *main_args,
         )
@@ -346,6 +372,7 @@ def make_attn_bwd(
                 "arch": arch,
                 "dq_interleave": dq_interleave,
                 "bf16": bf16,
+                "one_barrier": one_barrier and num_stages >= 3,
             },
             (B, Hq, Hkv, nq_pad, nk_pad),
             *main_args,
@@ -394,6 +421,7 @@ def attn_bwd(
     block_m=None,
     kb_major=None,
     seqused_k=None,
+    one_barrier=None,
 ):
     """Run the attention backward once.
 
@@ -417,6 +445,7 @@ def attn_bwd(
         block_m: As in ``make_attn_bwd``.
         kb_major: As in ``make_attn_bwd``.
         seqused_k: As in ``make_attn_bwd``.
+        one_barrier: As in ``make_attn_bwd``.
 
     Returns:
         ``(dq, dk, dv)`` in bf16.
@@ -441,6 +470,7 @@ def attn_bwd(
         block_m=block_m,
         kb_major=kb_major,
         seqused_k=seqused_k,
+        one_barrier=one_barrier,
     )
     launch()
     return finish()
@@ -470,23 +500,30 @@ BWD_CANDIDATES_SM80 = {
         for il in (False, True)
     ],
 }
-# e4m3 on SM89, 32 queries per dV/dK k step
+# e4m3 on SM89, fastest on an RTX 4070 Ti SUPER at n = 2048 and 8192 with dQ added as integers
 BWD_DEFAULTS_SM89 = {
-    128: {"num_stages": 3, "block_m": 32, "dq_interleave": True},
-    64: {"num_stages": 3, "block_m": 32, "dq_interleave": False},
+    128: {"num_stages": 2, "block_m": 32, "dq_interleave": True, "one_barrier": False},
+    64: {"num_stages": 2, "block_m": 64, "dq_interleave": True, "one_barrier": False},
+}
+# causal tiles finish unevenly, which one barrier per tile tolerates better
+BWD_DEFAULTS_CAUSAL_SM89 = {
+    128: {"num_stages": 3, "block_m": 32, "dq_interleave": False, "one_barrier": True},
+    64: {"num_stages": 3, "block_m": 64, "dq_interleave": False, "one_barrier": True},
 }
 # d128 with 64 queries spills
 BWD_CANDIDATES_SM89 = {
     128: [
-        {"block_m": 32, "num_stages": st, "dq_interleave": il}
+        {"block_m": 32, "num_stages": st, "dq_interleave": il, "one_barrier": ob}
         for st in (2, 3)
         for il in (False, True)
+        for ob in ((False, True) if st >= 3 else (False,))
     ],
     64: [
-        {"block_m": bm, "num_stages": st, "dq_interleave": il}
+        {"block_m": bm, "num_stages": st, "dq_interleave": il, "one_barrier": ob}
         for bm in (32, 64)
         for st in (2, 3)
         for il in (False, True)
+        for ob in ((False, True) if st >= 3 else (False,))
     ],
 }
 BWD_CANDIDATES = {
@@ -601,9 +638,11 @@ def autotune_attn_bwd(
     )
 
 
-def _defaults(arch, bf16):
+def _defaults(arch, bf16, causal=False):
     if arch != 120:
-        return BWD_DEFAULTS_SM80 if bf16 else BWD_DEFAULTS_SM89
+        if bf16:
+            return BWD_DEFAULTS_SM80
+        return BWD_DEFAULTS_CAUSAL_SM89 if causal else BWD_DEFAULTS_SM89
     return BWD_DEFAULTS_BF16 if bf16 else BWD_DEFAULTS
 
 

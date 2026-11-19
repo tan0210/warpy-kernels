@@ -579,3 +579,64 @@ def join_b16(lo, hi, *, loc=None, ip=None):
             ip,
         )
     )
+
+
+@dsl_user_op
+def pack_fixed2(x0, x1, *, loc=None, ip=None):
+    # `x0` and `x1` rounded to int32 lanes of one int64 that adds lane-wise, `x0` low
+    code = (
+        "{\n\t.reg .b32 a, b, z;\n\t.reg .s64 la, hb;\n\t"
+        "cvt.rni.s32.f32 a, $1;\n\tcvt.rni.s32.f32 b, $2;\n\t"
+        "cvt.s64.s32 la, a;\n\tmov.b32 z, 0;\n\tmov.b64 hb, {z, b};\n\t"
+        "add.s64 $0, hb, la;\n\t}"
+    )
+    return Int64(
+        asm(T.i64(), [Float32(x0), Float32(x1)], code, "=l,f,f", False, loc, ip)
+    )
+
+
+@dsl_user_op
+def red_add_u64(gaddr, val, *, loc=None, ip=None):
+    asm(
+        None,
+        [Int64(gaddr), Int64(val)],
+        "red.global.add.u64 [$0], $1;",
+        "l,l,~{memory}",
+        True,
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
+def ld_fixed2_f32(gaddr, *, loc=None, ip=None):
+    # the two int32 lane sums of a `pack_fixed2` accumulator at `gaddr`, as fp32
+    code = (
+        "{\n\t.reg .b32 l, h, s;\n\t"
+        "ld.global.v2.b32 {l, h}, [$2];\n\t"
+        "shr.s32 s, l, 31;\n\tsub.s32 h, h, s;\n\t"
+        "cvt.rn.f32.s32 $0, l;\n\tcvt.rn.f32.s32 $1, h;\n\t}"
+    )
+    res = asm(
+        llvm.StructType.get_literal([T.f32()] * 2),
+        [Int64(gaddr)],
+        code,
+        "=f,=f,l,~{memory}",
+        True,
+        loc,
+        ip,
+    )
+    return unpack_struct(res, T.f32(), Float32, 2, loc, ip)
+
+
+@dsl_user_op
+def st_shared_b64(saddr, val, *, loc=None, ip=None):
+    asm(
+        None,
+        [Int32(saddr), Int64(val)],
+        "st.shared.b64 [$0], $1;",
+        "r,l,~{memory}",
+        True,
+        loc,
+        ip,
+    )

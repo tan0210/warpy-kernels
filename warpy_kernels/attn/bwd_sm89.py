@@ -5,19 +5,22 @@ from cutlass import Float32, Int64, const_expr, cute
 
 from ..ptx import (
     ds_scale,
-    ld_shared_f32,
+    ld_global_nc_f32,
     ld_shared_v2_f32,
     ldsm_x4,
     ldsm_x4_trans,
     mma_fp8,
     pack_e4m3x4,
+    pack_fixed2,
     pack_half2,
     pow2_inv,
     prmt,
+    red_add_u64,
     st_global_v2_b32,
     st_shared_e4m3_pair,
 )
 from ..utils.fragments import ldsm_a, ldsm_b
+from .bwd_common import g_index
 from .bwd_sm80 import AttnBwdSm80
 
 
@@ -47,6 +50,9 @@ class AttnBwdSm89(AttnBwdSm80):
     """
 
     FP8 = True
+
+    def _g_row(self, row0):
+        return g_index(row0)
 
     def _dolo_tile(self, sbase, st):
         return self._tile(sbase, self.dolo_off + st * self.q_tile_bytes, self.BM)
@@ -173,7 +179,6 @@ class AttnBwdSm89(AttnBwdSm80):
         g = lane // 4
         t = lane % 4
         ktile = self._tile(sbase, self.k_off, self.BC)
-        gq_base = sbase + self.ld_off + st * self.ld_stage_bytes + 2 * self.BM * 4
         dchunks = d // 16
         zero = [Float32(0.0)] * 4
         for i in cutlass.range_constexpr(self.nb):
@@ -193,15 +198,28 @@ class AttnBwdSm89(AttnBwdSm80):
                     part[h] = mma_fp8(a, bk[h], part[h])
             for r in cutlass.range_constexpr(2):
                 q_loc = q0 + g + 8 * r
-                inv = pow2_inv(ld_shared_f32(gq_base + q_loc * 4))
+                # `cq = fq / gq` turns this tile's products into dQ in fixed point
+                cq = ld_global_nc_f32(self._gg + Int64(g_index(row0 + q_loc) + 128) * 4)
                 for e in cutlass.range_constexpr(2):
                     # even dims from the first B operand, odd from the second
                     col = c16 * 16 + 4 * t + 2 * e
                     addr = gdq + (Int64(row0 + q_loc) * d + Int64(col)) * 4
                     out.append(
-                        (addr, part[0][2 * r + e] * inv, part[1][2 * r + e] * inv)
+                        (
+                            addr,
+                            pack_fixed2(
+                                part[0][2 * r + e] * cq, part[1][2 * r + e] * cq
+                            ),
+                        )
                     )
         return out
+
+    def _red_dq(self, parts):
+        if const_expr(self.bf16):
+            AttnBwdSm80._red_dq(self, parts)
+        else:
+            for addr, v in parts:
+                red_add_u64(addr, v)
 
     @cute.jit
     def _store_dkdv(

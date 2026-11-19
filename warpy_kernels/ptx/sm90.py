@@ -33,6 +33,19 @@ def red_add_v2_f32(gaddr, v0, v1, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def bulk_reduce_add_u64(gaddr, saddr, nbytes, *, loc=None, ip=None):
+    asm(
+        None,
+        [Int64(gaddr), Int32(saddr), Int32(nbytes)],
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.u64 [$0], [$1], $2;",
+        "l,r,r,~{memory}",
+        True,
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
 def bulk_reduce_add_f32(gaddr, saddr, nbytes, *, loc=None, ip=None):
     asm(
         None,

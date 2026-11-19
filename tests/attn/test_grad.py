@@ -34,6 +34,7 @@ BWD_CONFIGS = [
     {"kb_major": True},
     {"block_m": 32},
     {"block_m": 64},
+    {"num_stages": 3, "one_barrier": True},
 ]
 
 
