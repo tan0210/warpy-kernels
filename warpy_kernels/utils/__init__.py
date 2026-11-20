@@ -237,7 +237,7 @@ def _bucket(n):
     return 1 << max(10, (int(n) - 1).bit_length())
 
 
-def tune_key(kind, d, causal, nq, nk, rep, arch=120):
+def tune_key(kind, d, causal, nq, nk, rep, arch):
     # SM120 keys carry no arch suffix, so caches tuned before other archs existed stay valid
     key = (
         f"{kind}|d={d}|causal={int(causal)}|nq={_bucket(nq)}|nk={_bucket(nk)}|rep={rep}"
@@ -267,7 +267,7 @@ def tune_store(key, cfg):
         pass
 
 
-def autotune(kind, d, causal, nq, nk, rep, candidates, build, iters, verbose, arch=120):
+def autotune(kind, d, causal, nq, nk, rep, candidates, build, iters, verbose, arch):
     best, results = time_candidates(candidates, build, iters, verbose, kind)
     tune_store(tune_key(kind, d, causal, nq, nk, rep, arch), best)
     return best, results
